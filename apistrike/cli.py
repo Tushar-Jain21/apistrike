@@ -1,6 +1,6 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, bola, crawl, recon, login, report.
+Commands: version, init-scope, scan, bola, bfla, crawl, recon, login, report.
 
 - crawl  : active recon -- discover shadow/undocumented endpoints, enumerate
            HTTP methods, and fuzz for hidden query params (API9:2023).
@@ -13,6 +13,9 @@ Commands: version, init-scope, scan, bola, crawl, recon, login, report.
            broken-authentication module (API2:2023) against the target.
 - bola   : Broken Object Level Authorization (API1:2023) -- log in two
            identities and diff their object access to confirm cross-user reads.
+- bfla   : Broken Function Level Authorization (API5:2023) -- confirm that a
+           lower-privilege (or unauthenticated) caller can invoke privileged
+           functions. Destructive methods are only fired with --active.
 
 Every network call is routed through the scope-gated ScopedHTTPClient, so an
 out-of-scope target is refused before any request is made.
@@ -394,6 +397,109 @@ def crawl(
         typer.echo(f"  [{tag}] {e.path}  ({e.status}; methods={methods}){params}")
     if res.findings:
         typer.echo(f"{len(res.findings)} inventory finding(s) recorded (total in DB: {summary['total']}).")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def bfla(
+    target: str = typer.Argument(..., help="Base URL of the API to test."),
+    username: str = typer.Option(..., "--username", "-u", help="Lower-privilege identity's username."),
+    password: str = typer.Option(..., "--password", "-p", help="Lower-privilege identity's password."),
+    admin_user: str = typer.Option("", "--admin-user", help="Optional privileged identity's username (establishes a confirmed baseline)."),
+    admin_pass: str = typer.Option("", "--admin-pass", help="Optional privileged identity's password."),
+    ops: str = typer.Option(
+        "GET /users/v1/_debug",
+        "--ops",
+        help="Privileged operations to test as 'METHOD /path', separated by ';'.",
+    ),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    active: bool = typer.Option(False, "--active", help="Also invoke destructive privileged functions (POST/PUT/PATCH/DELETE). Only for authorized engagements."),
+    no_unauth: bool = typer.Option(False, "--no-unauth", help="Skip the unauthenticated-invocation check."),
+) -> None:
+    """Broken Function Level Authorization (API5:2023): privileged-function access matrix."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.bfla import BflaModule, BflaIdentity, Operation
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=2)
+
+    operations = []
+    for token in ops.split(";"):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(None, 1)
+        if len(parts) != 2:
+            typer.echo(f"Invalid --ops entry '{token}'. Use 'METHOD /path' (e.g. 'GET /users/v1/_debug').")
+            raise typer.Exit(code=1)
+        operations.append(Operation(parts[0], parts[1]))
+    if not operations:
+        typer.echo("No operations to test. Provide --ops 'METHOD /path'.")
+        raise typer.Exit(code=1)
+
+    settings = Settings.load()
+    safe = sc.safe_mode and not active
+    if active and sc.safe_mode:
+        typer.echo("Note: --active overrides safe mode; destructive privileged functions WILL be invoked. Ensure this is authorized.")
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {safe} (active={active}).")
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            engine = AuthEngine(
+                client, base_url=target, login_config=LoginConfig(login_path=login_path)
+            )
+            identities = []
+            low = engine.add_identity(username, username=username, password=password)
+            low_token = await engine.login(low)
+            identities.append(
+                BflaIdentity(label=username, headers={"Authorization": f"Bearer {low_token}"}, role="user")
+            )
+            admin_label = None
+            if admin_user and admin_pass:
+                adm = engine.add_identity(admin_user, username=admin_user, password=admin_pass)
+                adm_token = await engine.login(adm)
+                admin_label = admin_user
+                identities.append(
+                    BflaIdentity(label=admin_user, headers={"Authorization": f"Bearer {adm_token}"}, role="admin")
+                )
+            typer.echo(
+                f"Authenticated {len(identities)} identity/identities; testing {len(operations)} privileged operation(s)..."
+            )
+            module = BflaModule(
+                client, base_url=target, identities=identities, operations=operations,
+                admin_label=admin_label, safe=safe, unauth_check=not no_unauth,
+            )
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"BFLA scan failed: {e}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"BFLA checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']})."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
     typer.echo("Run 'apistrike report' to generate the Markdown report.")
 
 
