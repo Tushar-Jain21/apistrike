@@ -1,14 +1,14 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, recon, login, report.
+Commands: version, init-scope, scan, bola, recon, login, report.
 
 - recon  : parse an OpenAPI/Swagger spec and list endpoints (read-only).
 - login  : authenticate against a target and show the captured token +
            decoded JWT claims (read-only inspection).
 - scan   : validate scope and, when credentials are supplied, run the
-           broken-authentication module (API2:2023) against the target and
-           record confirmed findings. Without credentials it only validates
-           scope and prepares the findings DB.
+           broken-authentication module (API2:2023) against the target.
+- bola   : Broken Object Level Authorization (API1:2023) -- log in two
+           identities and diff their object access to confirm cross-user reads.
 
 Every network call is routed through the scope-gated ScopedHTTPClient, so an
 out-of-scope target is refused before any request is made.
@@ -124,6 +124,88 @@ def scan(
         typer.echo(f"  - {note}")
     typer.echo(
         f"Broken-auth checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']})."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def bola(
+    target: str = typer.Argument(..., help="Base URL of the API to test."),
+    username: str = typer.Option(..., "--username", "-u", help="First identity's username."),
+    password: str = typer.Option(..., "--password", "-p", help="First identity's password."),
+    username2: str = typer.Option(..., "--username2", "-U", help="Second identity's username."),
+    password2: str = typer.Option(..., "--password2", "-P", help="Second identity's password."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    object_template: str = typer.Option(
+        "/users/v1/{username}",
+        help="Object path template; '{username}' is filled per identity to build each user's object.",
+    ),
+    enum: int = typer.Option(0, "--enum", help="Also probe N numeric-id neighbours for horizontal enumeration."),
+    no_unauth: bool = typer.Option(False, "--no-unauth", help="Skip the unauthenticated-access check."),
+) -> None:
+    """Broken Object Level Authorization (API1:2023): multi-user access diffing."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.bola import BolaModule, BolaIdentity, ObjectRef
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    creds = [(username, password), (username2, password2)]
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            engine = AuthEngine(
+                client, base_url=target, login_config=LoginConfig(login_path=login_path)
+            )
+            identities = []
+            objects = []
+            for uname, pw in creds:
+                ident = engine.add_identity(uname, username=uname, password=pw)
+                token = await engine.login(ident)
+                identities.append(
+                    BolaIdentity(label=uname, headers={"Authorization": f"Bearer {token}"}, username=uname)
+                )
+                objects.append(
+                    ObjectRef(path=object_template.format(username=uname), owner_label=uname, name=f"{uname}'s object")
+                )
+            typer.echo(f"Authenticated {len(identities)} identities; running BOLA access-matrix checks...")
+            module = BolaModule(
+                client, base_url=target, identities=identities, objects=objects,
+                unauth_check=not no_unauth, enumerate_spread=enum,
+            )
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"BOLA scan failed: {e}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"BOLA checks done: {len(result.findings)} finding(s) recorded "
         f"(total in DB: {summary['total']})."
     )
     for f in result.findings:
