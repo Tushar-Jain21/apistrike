@@ -1,0 +1,14 @@
+# APIStrike authorization scope — REQUIRED.
+# The tool refuses any request to a host not listed here. This is the
+# core safety guardrail: it keeps APIStrike authorized-only.
+
+allowed_hosts:
+  - localhost
+  - 127.0.0.1
+  # - vampi.local
+  # - crapi.local
+
+rate_limit: 5          # max requests per second (be polite)
+max_requests: 5000     # hard cap on total requests per run
+safe_mode: true        # block destructive tests
+allow_destructive: false
