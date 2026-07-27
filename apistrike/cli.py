@@ -1,6 +1,6 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, bola, bfla, inject, crawl, recon, login, report.
+Commands: version, init-scope, scan, bola, bfla, inject, ssrf, crawl, recon, login, report.
 
 - crawl  : active recon -- discover shadow/undocumented endpoints, enumerate
            HTTP methods, and fuzz for hidden query params (API9:2023).
@@ -19,6 +19,10 @@ Commands: version, init-scope, scan, bola, bfla, inject, crawl, recon, login, re
 - inject : Injection (SQLi / NoSQLi / OS-command) -- confirm injectable
            parameters via error, boolean-blind, time-based and NoSQL-operator
            techniques. All payloads are read/timing only (safe by default).
+- ssrf   : Server-Side Request Forgery (API7:2023) -- confirm SSRF via a
+           built-in out-of-band OAST callback listener, cloud-metadata
+           reachability, and timing. Probes are read-only (safe by default).
+           Use --selftest to prove the OAST loop with no target.
 
 Every network call is routed through the scope-gated ScopedHTTPClient, so an
 out-of-scope target is refused before any request is made.
@@ -584,6 +588,117 @@ def inject(
         typer.echo(f"  - {note}")
     typer.echo(
         f"Injection checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def ssrf(
+    target: str = typer.Argument(..., help="Base URL of the API to test."),
+    path: str = typer.Option(..., "--path", help="Endpoint path. For --location path, include the marker INJECT where the value goes."),
+    param: str = typer.Option(..., "--param", help="Parameter that takes a URL/host (or label for the injected path segment)."),
+    method: str = typer.Option("GET", "--method", help="HTTP method to use."),
+    location: str = typer.Option("query", "--location", help="Where the value lives: 'query', 'json' (body), or 'path'."),
+    benign: str = typer.Option("http://example.com/", "--benign", help="A benign external URL used as the baseline value."),
+    techniques: str = typer.Option("oast,metadata,timing", "--techniques", help="Comma-separated: oast,metadata,timing."),
+    oast_host: str = typer.Option("127.0.0.1", "--oast-host", help="Interface the OAST callback listener binds to."),
+    oast_port: int = typer.Option(0, "--oast-port", help="Port for the OAST listener (0 = auto-pick a free port)."),
+    oast_public: str = typer.Option("", "--oast-public", help="Host/IP the TARGET can reach the listener at (defaults to --oast-host). Use your LAN IP for containers."),
+    oast_wait_ms: int = typer.Option(2000, "--oast-wait-ms", help="Milliseconds to wait for an out-of-band callback."),
+    no_oast: bool = typer.Option(False, "--no-oast", help="Disable the OAST listener (metadata/timing only)."),
+    threshold_ms: int = typer.Option(3000, "--threshold-ms", help="Extra delay (ms) to treat a timing response as blind SSRF."),
+    username: str = typer.Option("", "--username", "-u", help="Optional username; if set, logs in and probes with a Bearer token."),
+    password: str = typer.Option("", "--password", "-p", help="Optional password for --username."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+    selftest: bool = typer.Option(False, "--selftest", help="Prove the OAST loop locally: start the listener and fire a loopback request at it (no target needed)."),
+) -> None:
+    """Server-Side Request Forgery (API7:2023): OAST callback + metadata + timing."""
+    import asyncio
+    import urllib.request
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.ssrf import OASTListener, SSRFModule, SSRFTarget
+
+    if selftest:
+        with OASTListener(host=oast_host, port=oast_port, public_host=(oast_public or None)) as listener:
+            tok = listener.new_token()
+            url = listener.payload_url(tok)
+            typer.echo(f"OAST listener up at {listener.base_url}. Firing loopback probe to {url} ...")
+            try:
+                urllib.request.urlopen(url, timeout=3).read()
+            except Exception as exc:  # noqa: BLE001
+                typer.echo(f"Loopback probe error: {exc}")
+            hits = listener.poll(tok, wait_ms=oast_wait_ms)
+            if hits:
+                typer.echo(f"OAST self-test PASSED: captured {len(hits)} callback(s) for token {tok}.")
+            else:
+                typer.echo("OAST self-test FAILED: no callback captured (check host/port/firewall).")
+        raise typer.Exit(code=0)
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as exc:
+        typer.echo(f"Refused: {exc}")
+        raise typer.Exit(code=2)
+
+    techs = [t.strip() for t in techniques.split(",") if t.strip()]
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    listener = None
+    if "oast" in techs and not no_oast:
+        listener = OASTListener(host=oast_host, port=oast_port, public_host=(oast_public or None)).start()
+        typer.echo(f"OAST callback listener started at {listener.base_url} (target must be able to reach this).")
+    typer.echo(f"Probing param '{param}' at {method.upper()} {path} ({location}); techniques={techs}.")
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                ident = engine.add_identity(username, username=username, password=password)
+                token = await engine.login(ident)
+                headers = {"Authorization": f"Bearer {token}"}
+                typer.echo(f"Authenticated as {username}; probing with a Bearer token.")
+            tgt = SSRFTarget(method=method, path=path, param=param, location=location, headers=headers, benign_value=benign)
+            module = SSRFModule(
+                client,
+                base_url=target,
+                targets=[tgt],
+                listener=listener,
+                techniques=techs,
+                time_threshold_ms=threshold_ms,
+                oast_wait_ms=oast_wait_ms,
+                safe=sc.safe_mode,
+            )
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except Exception as exc:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"SSRF scan failed: {exc}")
+        raise typer.Exit(code=1)
+    finally:
+        if listener is not None:
+            listener.stop()
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"SSRF checks done: {len(result.findings)} finding(s) recorded "
         f"(total in DB: {summary['total']}); {result.requests_made} requests."
     )
     for f in result.findings:
