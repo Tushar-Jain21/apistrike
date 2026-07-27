@@ -1,6 +1,7 @@
 """APIStrike command-line interface (Typer).
 
-Phase 1 skeleton: version, init-scope, scan (stub), report. Recon and the
+Phase 1 skeleton + Phase 2 recon: version, init-scope, scan (stub), report, and
+now `recon` which parses an OpenAPI/Swagger spec and lists its endpoints. The
 vulnerability modules are wired in during later phases. Nothing here attacks
 anything -- scan only validates scope and prepares the findings DB.
 """
@@ -14,6 +15,7 @@ import typer
 from apistrike.core.config import Settings
 from apistrike.core.findings import FindingsStore
 from apistrike.core.scope import Scope, OutOfScopeError
+from apistrike.recon.spec_parser import load_spec
 from apistrike.reporting.report import write_report
 
 __version__ = "0.1.0"
@@ -76,6 +78,26 @@ def scan(
         f"Findings DB ready at {settings.findings_db} ({summary['total']} existing)."
     )
     typer.echo("Recon + vulnerability modules land in later phases. Nothing was attacked.")
+
+
+@app.command()
+def recon(
+    spec: str = typer.Argument(..., help="URL or path to an OpenAPI/Swagger spec."),
+) -> None:
+    """Parse an API spec and list its endpoints (read-only, no attacks)."""
+    api = load_spec(spec)
+    typer.echo(f"{api.title} v{api.version}  ({api.base_url or 'no base url'})")
+    typer.echo(f"{len(api)} endpoints discovered:")
+    for e in api.endpoints:
+        flags = []
+        if e.path_params:
+            flags.append("path:" + ",".join(p.name for p in e.path_params))
+        if e.has_request_body:
+            flags.append("body")
+        if e.requires_auth:
+            flags.append("auth")
+        suffix = f"  [{'; '.join(flags)}]" if flags else ""
+        typer.echo(f"  {e.method:<6} {e.path}{suffix}")
 
 
 @app.command()
