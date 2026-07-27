@@ -1,0 +1,8 @@
+httpx
+typer
+pyyaml
+prance
+openapi-spec-validator
+pyjwt
+jinja2
+pytest
