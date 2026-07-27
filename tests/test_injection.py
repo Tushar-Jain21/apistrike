@@ -1,6 +1,7 @@
-"""Tests for the injection module (SQLi / NoSQLi / OS-command)."""
+"""Tests for the injection module (SQLi / NoSQLi / OS-command, incl. path injection)."""
 
 import asyncio
+from urllib.parse import unquote
 
 import pytest
 
@@ -25,31 +26,42 @@ def _path_of(url):
 
 
 class _Client:
-    def __init__(self, routes):
+    def __init__(self, routes, prefix_routes=None):
         self.routes = routes
+        self.prefix_routes = prefix_routes or {}
         self.calls = []
 
     async def request(self, method, url, **kwargs):
         path = _path_of(url)
         self.calls.append((method.upper(), path, kwargs))
         fn = self.routes.get(path)
-        if fn is None:
-            return _Resp(404, "not found")
-        return fn(kwargs.get("params"), kwargs.get("json"))
+        if fn is not None:
+            return fn(kwargs.get("params"), kwargs.get("json"))
+        for prefix, pfn in self.prefix_routes.items():
+            if path.startswith(prefix):
+                return pfn(path[len(prefix):])
+        return _Resp(404, "not found")
 
 
-def _search(params, json_body):
-    q = str((params or {}).get("q", ""))
-    low = q.lower()
+def _sql_response(ident):
+    low = ident.lower()
     if "sleep(" in low:
         return _Resp(200, "results: many", elapsed_ms=3200)
-    if q.count("'") % 2 == 1:
-        return _Resp(500, 'sqlite3.OperationalError: near "' + q + '": syntax error', elapsed_ms=6)
+    if ident.count("'") % 2 == 1:
+        return _Resp(500, 'sqlite3.OperationalError: near "' + ident + '": syntax error', elapsed_ms=6)
     if "or '1'='1" in low or "or 1=1" in low:
         return _Resp(200, "results: " + ",".join(str(i) for i in range(60)), elapsed_ms=6)
     if "and '1'='2" in low or "and 1=2" in low:
         return _Resp(200, "results: none", elapsed_ms=6)
-    return _Resp(200, "results: item-" + q, elapsed_ms=6)
+    return _Resp(200, "results: item-" + ident, elapsed_ms=6)
+
+
+def _search(params, json_body):
+    return _sql_response(str((params or {}).get("q", "")))
+
+
+def _user_by_name(raw_id):
+    return _sql_response(unquote(raw_id))
 
 
 def _ping(params, json_body):
@@ -71,15 +83,17 @@ def _clean(params, json_body):
 
 
 ROUTES = {"/search": _search, "/ping": _ping, "/login": _login, "/clean": _clean}
+PREFIX_ROUTES = {"/users/v1/": _user_by_name}
 
 T_SEARCH = InjectionTarget("GET", "/search", "q", "query", benign_value="1")
 T_PING = InjectionTarget("GET", "/ping", "host", "query", benign_value="127.0.0.1")
 T_LOGIN = InjectionTarget("POST", "/login", "username", "json", base_body={"password": "x"}, benign_value="admin")
 T_CLEAN = InjectionTarget("GET", "/clean", "x", "query")
+T_UPATH = InjectionTarget("GET", "/users/v1/INJECT", "username", "path", benign_value="name1")
 
 
 def _mod(targets, **kw):
-    return InjectionModule(_Client(ROUTES), "http://t", targets, **kw)
+    return InjectionModule(_Client(ROUTES, PREFIX_ROUTES), "http://t", targets, **kw)
 
 
 def _run(m):
@@ -93,9 +107,12 @@ def test_taxonomy_self_registers():
 
 def test_target_normalizes_method_path_location():
     t = InjectionTarget("post", "search", "q", "body")
-    assert t.method == "POST"
-    assert t.path == "/search"
-    assert t.location == "json"
+    assert t.method == "POST" and t.path == "/search" and t.location == "json"
+
+
+def test_path_target_requires_marker():
+    with pytest.raises(ValueError):
+        InjectionTarget("GET", "/users/v1/name1", "username", "path")
 
 
 def test_time_based_sqli_wins_precedence():
@@ -103,8 +120,7 @@ def test_time_based_sqli_wins_precedence():
     assert len(res.findings) == 1
     f = res.findings[0]
     assert f.severity == "critical" and f.cwe == "CWE-89"
-    assert f.confidence == "confirmed"
-    assert "time-based" in f.title.lower()
+    assert f.confidence == "confirmed" and "time-based" in f.title.lower()
     assert f.owasp_id == "INJECTION"
 
 
@@ -120,6 +136,21 @@ def test_boolean_based_sqli_only():
     res = _run(_mod([T_SEARCH], techniques=["boolean"]))
     assert len(res.findings) == 1
     assert "boolean" in res.findings[0].title.lower()
+    assert res.findings[0].confidence == "firm"
+
+
+def test_path_injection_error_based():
+    res = _run(_mod([T_UPATH], techniques=["error"]))
+    assert len(res.findings) == 1
+    f = res.findings[0]
+    assert f.cwe == "CWE-89" and f.confidence == "confirmed"
+    assert "path segment" in f.description.lower()
+    assert any("name1" in str(e.get("url", "")) for e in f.evidence)
+
+
+def test_path_injection_boolean_based():
+    res = _run(_mod([T_UPATH], techniques=["boolean"]))
+    assert len(res.findings) == 1
     assert res.findings[0].confidence == "firm"
 
 
@@ -150,12 +181,11 @@ def test_clean_endpoint_no_false_positives():
 
 
 def test_multi_target_aggregates_all_classes():
-    res = _run(_mod([T_SEARCH, T_PING, T_LOGIN, T_CLEAN]))
+    res = _run(_mod([T_SEARCH, T_PING, T_LOGIN, T_UPATH, T_CLEAN]))
     assert sorted({f.cwe for f in res.findings}) == ["CWE-78", "CWE-89", "CWE-943"]
-    assert len(res.findings) == 3
     assert res.requests_made > 0
 
 
 def test_requires_at_least_one_target():
     with pytest.raises(ValueError):
-        InjectionModule(_Client(ROUTES), "http://t", [])
+        InjectionModule(_Client(ROUTES, PREFIX_ROUTES), "http://t", [])

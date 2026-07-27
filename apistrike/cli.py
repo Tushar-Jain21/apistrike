@@ -509,11 +509,11 @@ def bfla(
 @app.command()
 def inject(
     target: str = typer.Argument(..., help="Base URL of the API to test."),
-    path: str = typer.Option(..., "--path", help="Endpoint path to test, e.g. /books/v1/search."),
-    param: str = typer.Option(..., "--param", help="Parameter name to inject into."),
+    path: str = typer.Option(..., "--path", help="Endpoint path to test. For --location path, include the marker INJECT where the value goes, e.g. /users/v1/INJECT."),
+    param: str = typer.Option(..., "--param", help="Parameter name (or a label for the injected path segment)."),
     method: str = typer.Option("GET", "--method", help="HTTP method to use."),
-    location: str = typer.Option("query", "--location", help="Where the parameter lives: 'query' or 'json' (request body)."),
-    benign: str = typer.Option("1", "--benign", help="A benign baseline value for the parameter."),
+    location: str = typer.Option("query", "--location", help="Where the value lives: 'query', 'json' (request body), or 'path' (URL path segment at the INJECT marker)."),
+    benign: str = typer.Option("1", "--benign", help="A benign baseline value (for path injection, a valid id such as name1)."),
     techniques: str = typer.Option(
         "error,boolean,time_sql,time_cmd,nosql",
         "--techniques",
