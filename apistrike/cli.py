@@ -1,6 +1,6 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, crawl, recon, login, report.
+Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, misconfig, dataexpose, ratelimit, inventory, graphql, crawl, recon, login, report.
 
 - crawl  : active recon -- discover shadow/undocumented endpoints, enumerate
            HTTP methods, and fuzz for hidden query params (API9:2023).
@@ -28,6 +28,32 @@ Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, crawl
            ...) into a create request, then read the object back to confirm the
            value persisted. A control object rules out server-side defaults, so
            false positives stay near zero.
+- misconfig : Security misconfiguration (API8:2023) -- check for missing
+           security headers, permissive CORS (origin reflection / wildcard),
+           verbose error/stack-trace disclosure, HTTP TRACE (XST), and
+           software version banners. All checks are read-only (safe by default).
+- dataexpose : Excessive data exposure (API3:2023) -- fetch endpoints and scan
+           responses for leaked secrets (keys, tokens, password hashes, DB
+           URIs), sensitive JSON fields (password, ssn, api_key, ...), PII
+           (emails, SSNs, Luhn-valid card numbers), and high-entropy strings.
+           Read-only; evidence values are masked/redacted.
+- ratelimit : Rate limiting / unrestricted resource consumption (API4:2023) --
+           send a small, bounded burst and flag endpoints that are never
+           throttled (no HTTP 429, no rate-limit headers), and probe for
+           client-controlled page sizes / response amplification. The burst is
+           capped by the scope's max_requests; all requests are read-only GETs.
+- inventory : Improper inventory management (API9:2023) -- probe sibling API
+           versions (v0/v2/v3/...) for undocumented / old / "zombie" versions
+           that are still reachable, and probe a curated list of non-production
+           and documentation surfaces (OpenAPI/Swagger specs, GraphQL consoles,
+           actuator, .env, debug/console, metrics, ...). A soft-404 baseline is
+           calibrated first so catch-all servers don't cause false positives.
+           All probes are read-only GETs (safe by default).
+- graphql : GraphQL security checks -- introspection enabled (schema dump),
+           "Did you mean" field-suggestion leakage, array query batching
+           (resource amplification), and mutations reachable over HTTP GET
+           (CSRF surface). Confirmation-based and read-only (the mutation probe
+           is `mutation{__typename}`, which changes no state).
 
 Every network call is routed through the scope-gated ScopedHTTPClient, so an
 out-of-scope target is refused before any request is made.
@@ -823,6 +849,423 @@ def massassign(
         typer.echo(f"  - {note}")
     typer.echo(
         f"Mass assignment checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def misconfig(
+    target: str = typer.Argument(..., help="Base URL of the target API"),
+    path: str = typer.Option("/", "--path", help="Representative endpoint path to probe"),
+    checks: str = typer.Option(
+        "headers,cors,errors,methods,banner", "--checks",
+        help="Comma-separated checks: headers,cors,errors,methods,banner",
+    ),
+    evil_origin: str = typer.Option(
+        "https://evil.attacker.test", "--evil-origin",
+        help="Origin header used for the CORS reflection probe",
+    ),
+    username: str = typer.Option(None, "-u", "--username", help="Optional username to authenticate first"),
+    password: str = typer.Option(None, "-p", "--password", help="Optional password to authenticate first"),
+    login_path: str = typer.Option("/users/v1/login", "--login-path", help="Login path used when credentials are supplied"),
+    scope: str = typer.Option("scope.yaml", "--scope", help="Path to the scope file"),
+) -> None:
+    """Security misconfiguration checks (OWASP API8:2023)."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.misconfig import MisconfigModule
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file not found: {scope}")
+        raise typer.Exit(code=1)
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as exc:
+        typer.echo(f"Target out of scope: {exc}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    selected = tuple(c.strip() for c in checks.split(",") if c.strip())
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                auth = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                auth.add_identity("primary", username=username, password=password)
+                token = await auth.login("primary")
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            try:
+                module = MisconfigModule(
+                    client,
+                    base_url=target,
+                    probe_paths=[path],
+                    evil_origin=evil_origin,
+                    checks=selected,
+                    headers=headers,
+                    safe=sc.safe_mode,
+                )
+            except ValueError as exc:
+                typer.echo(f"Invalid configuration: {exc}")
+                raise typer.Exit(code=1)
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Misconfiguration scan failed: {exc}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Misconfiguration checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def dataexpose(
+    target: str = typer.Argument(..., help="Base URL of the target API"),
+    paths: str = typer.Option("/", "--paths", help="Comma-separated endpoint paths to scan"),
+    method: str = typer.Option("GET", "--method", help="HTTP method used for each path"),
+    checks: str = typer.Option(
+        "secrets,fields,pii,entropy", "--checks",
+        help="Comma-separated checks: secrets,fields,pii,entropy",
+    ),
+    entropy_threshold: float = typer.Option(4.0, "--entropy-threshold", help="Shannon-entropy threshold for the entropy check"),
+    entropy_min_len: int = typer.Option(24, "--entropy-min-len", help="Minimum token length for the entropy check"),
+    username: str = typer.Option(None, "-u", "--username", help="Optional username to authenticate first"),
+    password: str = typer.Option(None, "-p", "--password", help="Optional password to authenticate first"),
+    login_path: str = typer.Option("/users/v1/login", "--login-path", help="Login path used when credentials are supplied"),
+    scope: str = typer.Option("scope.yaml", "--scope", help="Path to the scope file"),
+) -> None:
+    """Excessive data exposure scan (OWASP API3:2023)."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.data_exposure import DataExposureModule, DataExposureTarget
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file not found: {scope}")
+        raise typer.Exit(code=1)
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as exc:
+        typer.echo(f"Target out of scope: {exc}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    selected = tuple(c.strip() for c in checks.split(",") if c.strip())
+    scan_paths = [p.strip() for p in paths.split(",") if p.strip()] or ["/"]
+    targets = [DataExposureTarget(path=p, method=method) for p in scan_paths]
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                auth = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                auth.add_identity("primary", username=username, password=password)
+                token = await auth.login("primary")
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            try:
+                module = DataExposureModule(
+                    client,
+                    base_url=target,
+                    targets=targets,
+                    checks=selected,
+                    entropy_threshold=entropy_threshold,
+                    entropy_min_len=entropy_min_len,
+                    headers=headers,
+                    safe=sc.safe_mode,
+                )
+            except ValueError as exc:
+                typer.echo(f"Invalid configuration: {exc}")
+                raise typer.Exit(code=1)
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Data exposure scan failed: {exc}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Data exposure checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def ratelimit(
+    target: str = typer.Argument(..., help="Base URL of the target API"),
+    paths: str = typer.Option("/", "--paths", help="Comma-separated endpoint paths to test"),
+    method: str = typer.Option("GET", "--method", help="HTTP method used for each path"),
+    checks: str = typer.Option(
+        "burst,pagination", "--checks",
+        help="Comma-separated checks: burst,pagination",
+    ),
+    burst: int = typer.Option(25, "--burst", help="Number of requests in the throttling burst (capped by scope max_requests)"),
+    large_value: int = typer.Option(1000, "--large-value", help="Oversized page-size value used for the pagination probe"),
+    min_items: int = typer.Option(50, "--min-items", help="Minimum item count that counts as an uncapped page"),
+    username: str = typer.Option(None, "-u", "--username", help="Optional username to authenticate first"),
+    password: str = typer.Option(None, "-p", "--password", help="Optional password to authenticate first"),
+    login_path: str = typer.Option("/users/v1/login", "--login-path", help="Login path used when credentials are supplied"),
+    scope: str = typer.Option("scope.yaml", "--scope", help="Path to the scope file"),
+) -> None:
+    """Rate limiting / unrestricted resource consumption checks (OWASP API4:2023)."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.rate_limit import RateLimitModule, RateLimitTarget
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file not found: {scope}")
+        raise typer.Exit(code=1)
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as exc:
+        typer.echo(f"Target out of scope: {exc}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    selected = tuple(c.strip() for c in checks.split(",") if c.strip())
+    scan_paths = [p.strip() for p in paths.split(",") if p.strip()] or ["/"]
+    targets = [RateLimitTarget(path=p, method=method) for p in scan_paths]
+    max_requests = getattr(sc, "max_requests", None)
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                auth = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                auth.add_identity("primary", username=username, password=password)
+                token = await auth.login("primary")
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            try:
+                module = RateLimitModule(
+                    client,
+                    base_url=target,
+                    targets=targets,
+                    checks=selected,
+                    burst=burst,
+                    large_value=large_value,
+                    min_items=min_items,
+                    headers=headers,
+                    safe=sc.safe_mode,
+                    max_requests=max_requests,
+                )
+            except ValueError as exc:
+                typer.echo(f"Invalid configuration: {exc}")
+                raise typer.Exit(code=1)
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Rate limiting scan failed: {exc}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Rate limiting checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def inventory(
+    target: str = typer.Argument(..., help="Base URL of the API to test."),
+    paths: str = typer.Option("", "--paths", help="Comma-separated documented version-bearing paths for the version check, e.g. /users/v1/users."),
+    max_version: int = typer.Option(4, "--max-version", help="Highest /vN version number to probe for undocumented versions."),
+    checks: str = typer.Option("versions,surfaces", "--checks", help="Comma-separated checks: versions,surfaces."),
+    extra_surfaces: str = typer.Option("", "--extra-surfaces", help="Comma-separated extra surface paths to probe (severity assumed medium/CWE-200)."),
+    username: str = typer.Option("", "--username", "-u", help="Optional username; if set, logs in and probes with a Bearer token."),
+    password: str = typer.Option("", "--password", "-p", help="Optional password for --username."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+) -> None:
+    """Improper inventory (API9:2023): undocumented API versions + exposed surfaces."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.inventory import InventoryModule, DEFAULT_SURFACES
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=2)
+
+    documented = [p.strip() for p in paths.split(",") if p.strip()]
+    chk = [c.strip() for c in checks.split(",") if c.strip()]
+    surfaces = list(DEFAULT_SURFACES)
+    for extra in [s.strip() for s in extra_surfaces.split(",") if s.strip()]:
+        ep = extra if extra.startswith("/") else "/" + extra
+        surfaces.append((ep, "medium", "Custom surface " + ep, "CWE-200"))
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                engine = AuthEngine(
+                    client, base_url=target, login_config=LoginConfig(login_path=login_path)
+                )
+                ident = engine.add_identity(username, username=username, password=password)
+                token = await engine.login(ident)
+                headers = {"Authorization": f"Bearer {token}"}
+                typer.echo(f"Authenticated as {username}; probing with a Bearer token.")
+            module = InventoryModule(
+                client, base_url=target, documented_paths=documented,
+                max_version=max_version, surface_paths=surfaces, checks=chk,
+                headers=headers, safe=sc.safe_mode,
+            )
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except ValueError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=1)
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Inventory scan failed: {e}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Inventory checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def graphql(
+    target: str = typer.Argument(..., help="Base URL of the API to test."),
+    endpoint: str = typer.Option("/graphql", "--endpoint", help="Path of the GraphQL endpoint on the target."),
+    checks: str = typer.Option("introspection,suggestions,batching,get_mutation", "--checks", help="Comma-separated checks: introspection,suggestions,batching,get_mutation."),
+    username: str = typer.Option("", "--username", "-u", help="Optional username; if set, logs in and probes with a Bearer token."),
+    password: str = typer.Option("", "--password", "-p", help="Optional password for --username."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+) -> None:
+    """GraphQL security checks: introspection, suggestions, batching, GET mutations."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.graphql import GraphQLModule
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=2)
+
+    chk = [c.strip() for c in checks.split(",") if c.strip()]
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+    typer.echo(f"Probing GraphQL endpoint {endpoint}; checks={chk}.")
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                engine = AuthEngine(
+                    client, base_url=target, login_config=LoginConfig(login_path=login_path)
+                )
+                ident = engine.add_identity(username, username=username, password=password)
+                token = await engine.login(ident)
+                headers = {"Authorization": f"Bearer {token}"}
+                typer.echo(f"Authenticated as {username}; probing with a Bearer token.")
+            module = GraphQLModule(
+                client, base_url=target, endpoint=endpoint, checks=chk,
+                headers=headers, safe=sc.safe_mode,
+            )
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except ValueError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=1)
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"GraphQL scan failed: {e}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"GraphQL checks done: {len(result.findings)} finding(s) recorded "
         f"(total in DB: {summary['total']}); {result.requests_made} requests."
     )
     for f in result.findings:
