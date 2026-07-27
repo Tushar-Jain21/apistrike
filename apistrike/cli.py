@@ -1,7 +1,11 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, bola, recon, login, report.
+Commands: version, init-scope, scan, bola, crawl, recon, login, report.
 
+- crawl  : active recon -- discover shadow/undocumented endpoints, enumerate
+           HTTP methods, and fuzz for hidden query params (API9:2023).
+           Read-only in safe mode (methods read via OPTIONS); state-changing
+           verbs are only sent with the explicit --active flag.
 - recon  : parse an OpenAPI/Swagger spec and list endpoints (read-only).
 - login  : authenticate against a target and show the captured token +
            decoded JWT claims (read-only inspection).
@@ -295,6 +299,102 @@ def report(
     with FindingsStore(settings.findings_db) as store:
         path = write_report(store, output, target=target)
     typer.echo(f"Report written to {path}")
+
+
+@app.command()
+def crawl(
+    target: str = typer.Argument(..., help="Base URL of the API to crawl."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+    spec: str = typer.Option("", "--spec", help="Optional OpenAPI/Swagger spec to seed documented endpoints and base paths."),
+    wordlist: str = typer.Option("", "--wordlist", "-w", help="Path to a path wordlist (e.g. a local SecLists file). Falls back to a small bundled list."),
+    param_wordlist: str = typer.Option("", "--param-wordlist", help="Optional path to a parameter wordlist."),
+    active: bool = typer.Option(False, "--active", help="Actively probe state-changing methods (POST/PUT/PATCH/DELETE). Only for explicitly authorized engagements."),
+    no_params: bool = typer.Option(False, "--no-params", help="Skip query-parameter fuzzing."),
+    no_methods: bool = typer.Option(False, "--no-methods", help="Skip HTTP method enumeration."),
+) -> None:
+    """Recon crawler (API9:2023): discover shadow endpoints, methods and hidden params."""
+    import asyncio
+
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.recon.crawler import Crawler, load_wordlist
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+
+    # In safe mode we never fire destructive verbs; --active is the explicit opt-in.
+    safe = sc.safe_mode and not active
+    if active and sc.safe_mode:
+        typer.echo("Note: --active overrides safe mode; state-changing methods WILL be sent. Ensure this is authorized.")
+
+    seeds = []
+    bases = ["/"]
+    if spec:
+        try:
+            api = load_spec(spec)
+            seeds = [e.path for e in api.endpoints]
+            prefixes = set()
+            for p in seeds:
+                parts = [s for s in p.split("/") if s]
+                if parts:
+                    prefixes.add("/" + parts[0])
+                if len(parts) >= 2:
+                    prefixes.add("/" + "/".join(parts[:2]))
+            if prefixes:
+                bases = ["/"] + sorted(prefixes)
+        except Exception as e:  # noqa: BLE001
+            typer.echo(f"Could not load spec '{spec}': {e}")
+
+    words = load_wordlist(wordlist or None)
+    param_words = load_wordlist(param_wordlist, fallback=[]) if param_wordlist else []
+
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {safe} (active={active}).")
+    typer.echo(f"Seeded {len(seeds)} documented endpoint(s); {len(words)} path words; bases={bases}.")
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            crawler = Crawler(
+                client, base_url=target,
+                seed_endpoints=seeds, path_words=words, param_words=param_words,
+                bases=bases, fuzz_params=not no_params, method_enum=not no_methods,
+                safe=safe,
+            )
+            return await crawler.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            res = asyncio.run(_run(store))
+            summary = store.summary()
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Crawl failed: {e}")
+        raise typer.Exit(code=1)
+
+    for note in res.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Crawl done: {len(res.endpoints)} live endpoint(s), "
+        f"{len(res.shadow_endpoints)} shadow, "
+        f"{sum(len(v) for v in res.discovered_params.values())} hidden param(s); "
+        f"{res.requests_made} requests."
+    )
+    for e in res.endpoints:
+        tag = "spec" if e.source == "spec" else "SHADOW"
+        methods = ",".join(e.methods_allowed) if e.methods_allowed else "?"
+        params = ("  params:" + ",".join(e.params_found)) if e.params_found else ""
+        typer.echo(f"  [{tag}] {e.path}  ({e.status}; methods={methods}){params}")
+    if res.findings:
+        typer.echo(f"{len(res.findings)} inventory finding(s) recorded (total in DB: {summary['total']}).")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
 
 
 if __name__ == "__main__":
