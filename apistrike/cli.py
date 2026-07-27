@@ -1,6 +1,6 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, crawl, recon, login, report.
+Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, misconfig, crawl, recon, login, report.
 
 - crawl  : active recon -- discover shadow/undocumented endpoints, enumerate
            HTTP methods, and fuzz for hidden query params (API9:2023).
@@ -28,6 +28,10 @@ Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, crawl
            ...) into a create request, then read the object back to confirm the
            value persisted. A control object rules out server-side defaults, so
            false positives stay near zero.
+- misconfig : Security misconfiguration (API8:2023) -- check for missing
+           security headers, permissive CORS (origin reflection / wildcard),
+           verbose error/stack-trace disclosure, HTTP TRACE (XST), and
+           software version banners. All checks are read-only (safe by default).
 
 Every network call is routed through the scope-gated ScopedHTTPClient, so an
 out-of-scope target is refused before any request is made.
@@ -823,6 +827,91 @@ def massassign(
         typer.echo(f"  - {note}")
     typer.echo(
         f"Mass assignment checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def misconfig(
+    target: str = typer.Argument(..., help="Base URL of the target API"),
+    path: str = typer.Option("/", "--path", help="Representative endpoint path to probe"),
+    checks: str = typer.Option(
+        "headers,cors,errors,methods,banner", "--checks",
+        help="Comma-separated checks: headers,cors,errors,methods,banner",
+    ),
+    evil_origin: str = typer.Option(
+        "https://evil.attacker.test", "--evil-origin",
+        help="Origin header used for the CORS reflection probe",
+    ),
+    username: str = typer.Option(None, "-u", "--username", help="Optional username to authenticate first"),
+    password: str = typer.Option(None, "-p", "--password", help="Optional password to authenticate first"),
+    login_path: str = typer.Option("/users/v1/login", "--login-path", help="Login path used when credentials are supplied"),
+    scope: str = typer.Option("scope.yaml", "--scope", help="Path to the scope file"),
+) -> None:
+    """Security misconfiguration checks (OWASP API8:2023)."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.misconfig import MisconfigModule
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file not found: {scope}")
+        raise typer.Exit(code=1)
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as exc:
+        typer.echo(f"Target out of scope: {exc}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    selected = tuple(c.strip() for c in checks.split(",") if c.strip())
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                auth = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                auth.add_identity("primary", username=username, password=password)
+                token = await auth.login("primary")
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            try:
+                module = MisconfigModule(
+                    client,
+                    base_url=target,
+                    probe_paths=[path],
+                    evil_origin=evil_origin,
+                    checks=selected,
+                    headers=headers,
+                    safe=sc.safe_mode,
+                )
+            except ValueError as exc:
+                typer.echo(f"Invalid configuration: {exc}")
+                raise typer.Exit(code=1)
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Misconfiguration scan failed: {exc}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Misconfiguration checks done: {len(result.findings)} finding(s) recorded "
         f"(total in DB: {summary['total']}); {result.requests_made} requests."
     )
     for f in result.findings:
