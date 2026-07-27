@@ -1,11 +1,17 @@
 """APIStrike command-line interface (Typer).
 
-Phase 1 skeleton + Phase 2 recon & auth: version, init-scope, scan (stub),
-report, `recon` (parse an OpenAPI/Swagger spec and list endpoints), and now
-`login` (authenticate against a target and show the captured token + decoded
-JWT claims, read-only). The vulnerability modules are wired in during later
-phases. Nothing here attacks anything -- scan only validates scope and prepares
-the findings DB; login only performs the API's own login call.
+Commands: version, init-scope, scan, recon, login, report.
+
+- recon  : parse an OpenAPI/Swagger spec and list endpoints (read-only).
+- login  : authenticate against a target and show the captured token +
+           decoded JWT claims (read-only inspection).
+- scan   : validate scope and, when credentials are supplied, run the
+           broken-authentication module (API2:2023) against the target and
+           record confirmed findings. Without credentials it only validates
+           scope and prepares the findings DB.
+
+Every network call is routed through the scope-gated ScopedHTTPClient, so an
+out-of-scope target is refused before any request is made.
 """
 from __future__ import annotations
 
@@ -57,8 +63,12 @@ def init_scope(
 def scan(
     target: str = typer.Argument(..., help="Base URL of the API to test."),
     scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+    username: str = typer.Option("", "--username", "-u", help="Username for auth-based checks."),
+    password: str = typer.Option("", "--password", "-p", help="Password for auth-based checks."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    probe_path: str = typer.Option("/me", help="Authenticated endpoint used to test tampered tokens."),
 ) -> None:
-    """Run a scan (Phase 1 stub: validates scope + prepares findings DB)."""
+    """Run a scan: validate scope, then (with -u/-p) run the broken-auth module."""
     try:
         sc = Scope.from_file(scope)
     except FileNotFoundError:
@@ -72,14 +82,53 @@ def scan(
         raise typer.Exit(code=2)
 
     settings = Settings.load()
-    with FindingsStore(settings.findings_db) as store:
-        summary = store.summary()
-
     typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    if not (username and password):
+        with FindingsStore(settings.findings_db) as store:
+            summary = store.summary()
+        typer.echo(
+            f"No credentials given (-u/-p). Findings DB ready at {settings.findings_db} "
+            f"({summary['total']} existing). Provide -u/-p to run the broken-auth module."
+        )
+        return
+
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.broken_auth import BrokenAuthModule
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            engine = AuthEngine(
+                client, base_url=target, login_config=LoginConfig(login_path=login_path)
+            )
+            ident = engine.add_identity(username, username=username, password=password)
+            token = await engine.login(ident)
+            typer.echo(f"Authenticated as {username}; running broken-authentication checks...")
+            module = BrokenAuthModule(
+                client, base_url=target, valid_token=token, probe_path=probe_path
+            )
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Scan failed: {e}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
     typer.echo(
-        f"Findings DB ready at {settings.findings_db} ({summary['total']} existing)."
+        f"Broken-auth checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']})."
     )
-    typer.echo("Recon + vulnerability modules land in later phases. Nothing was attacked.")
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
 
 
 @app.command()
