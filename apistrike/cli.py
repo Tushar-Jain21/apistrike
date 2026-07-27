@@ -1,6 +1,6 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, bola, bfla, crawl, recon, login, report.
+Commands: version, init-scope, scan, bola, bfla, inject, crawl, recon, login, report.
 
 - crawl  : active recon -- discover shadow/undocumented endpoints, enumerate
            HTTP methods, and fuzz for hidden query params (API9:2023).
@@ -16,6 +16,9 @@ Commands: version, init-scope, scan, bola, bfla, crawl, recon, login, report.
 - bfla   : Broken Function Level Authorization (API5:2023) -- confirm that a
            lower-privilege (or unauthenticated) caller can invoke privileged
            functions. Destructive methods are only fired with --active.
+- inject : Injection (SQLi / NoSQLi / OS-command) -- confirm injectable
+           parameters via error, boolean-blind, time-based and NoSQL-operator
+           techniques. All payloads are read/timing only (safe by default).
 
 Every network call is routed through the scope-gated ScopedHTTPClient, so an
 out-of-scope target is refused before any request is made.
@@ -497,6 +500,91 @@ def bfla(
     typer.echo(
         f"BFLA checks done: {len(result.findings)} finding(s) recorded "
         f"(total in DB: {summary['total']})."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def inject(
+    target: str = typer.Argument(..., help="Base URL of the API to test."),
+    path: str = typer.Option(..., "--path", help="Endpoint path to test, e.g. /books/v1/search."),
+    param: str = typer.Option(..., "--param", help="Parameter name to inject into."),
+    method: str = typer.Option("GET", "--method", help="HTTP method to use."),
+    location: str = typer.Option("query", "--location", help="Where the parameter lives: 'query' or 'json' (request body)."),
+    benign: str = typer.Option("1", "--benign", help="A benign baseline value for the parameter."),
+    techniques: str = typer.Option(
+        "error,boolean,time_sql,time_cmd,nosql",
+        "--techniques",
+        help="Comma-separated techniques: error,boolean,time_sql,time_cmd,nosql.",
+    ),
+    delay: int = typer.Option(3, "--delay", help="Seconds requested by time-based payloads."),
+    threshold_ms: int = typer.Option(2500, "--threshold-ms", help="Minimum extra delay (ms) to treat a time-based response as a hit."),
+    username: str = typer.Option("", "--username", "-u", help="Optional username; if set, logs in and injects with a Bearer token."),
+    password: str = typer.Option("", "--password", "-p", help="Optional password for --username."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+) -> None:
+    """Injection (SQLi / NoSQLi / OS-command): confirm injectable params with real requests."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.injection import InjectionModule, InjectionTarget
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=2)
+
+    techs = [t.strip() for t in techniques.split(",") if t.strip()]
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+    typer.echo(f"Testing param '{param}' at {method.upper()} {path} ({location}); techniques={techs}.")
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                engine = AuthEngine(
+                    client, base_url=target, login_config=LoginConfig(login_path=login_path)
+                )
+                ident = engine.add_identity(username, username=username, password=password)
+                token = await engine.login(ident)
+                headers = {"Authorization": f"Bearer {token}"}
+                typer.echo(f"Authenticated as {username}; injecting with a Bearer token.")
+            tgt = InjectionTarget(
+                method=method, path=path, param=param, location=location,
+                headers=headers, benign_value=benign,
+            )
+            module = InjectionModule(
+                client, base_url=target, targets=[tgt],
+                techniques=techs, time_delay=delay, time_threshold_ms=threshold_ms,
+                safe=sc.safe_mode,
+            )
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Injection scan failed: {e}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Injection checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
     )
     for f in result.findings:
         typer.echo(f"  [{f.severity.upper()}] {f.title}")
