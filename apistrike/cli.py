@@ -1,6 +1,6 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, misconfig, crawl, recon, login, report.
+Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, misconfig, dataexpose, crawl, recon, login, report.
 
 - crawl  : active recon -- discover shadow/undocumented endpoints, enumerate
            HTTP methods, and fuzz for hidden query params (API9:2023).
@@ -32,6 +32,11 @@ Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, misco
            security headers, permissive CORS (origin reflection / wildcard),
            verbose error/stack-trace disclosure, HTTP TRACE (XST), and
            software version banners. All checks are read-only (safe by default).
+- dataexpose : Excessive data exposure (API3:2023) -- fetch endpoints and scan
+           responses for leaked secrets (keys, tokens, password hashes, DB
+           URIs), sensitive JSON fields (password, ssn, api_key, ...), PII
+           (emails, SSNs, Luhn-valid card numbers), and high-entropy strings.
+           Read-only; evidence values are masked/redacted.
 
 Every network call is routed through the scope-gated ScopedHTTPClient, so an
 out-of-scope target is refused before any request is made.
@@ -912,6 +917,93 @@ def misconfig(
         typer.echo(f"  - {note}")
     typer.echo(
         f"Misconfiguration checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def dataexpose(
+    target: str = typer.Argument(..., help="Base URL of the target API"),
+    paths: str = typer.Option("/", "--paths", help="Comma-separated endpoint paths to scan"),
+    method: str = typer.Option("GET", "--method", help="HTTP method used for each path"),
+    checks: str = typer.Option(
+        "secrets,fields,pii,entropy", "--checks",
+        help="Comma-separated checks: secrets,fields,pii,entropy",
+    ),
+    entropy_threshold: float = typer.Option(4.0, "--entropy-threshold", help="Shannon-entropy threshold for the entropy check"),
+    entropy_min_len: int = typer.Option(24, "--entropy-min-len", help="Minimum token length for the entropy check"),
+    username: str = typer.Option(None, "-u", "--username", help="Optional username to authenticate first"),
+    password: str = typer.Option(None, "-p", "--password", help="Optional password to authenticate first"),
+    login_path: str = typer.Option("/users/v1/login", "--login-path", help="Login path used when credentials are supplied"),
+    scope: str = typer.Option("scope.yaml", "--scope", help="Path to the scope file"),
+) -> None:
+    """Excessive data exposure scan (OWASP API3:2023)."""
+    import asyncio
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.data_exposure import DataExposureModule, DataExposureTarget
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file not found: {scope}")
+        raise typer.Exit(code=1)
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as exc:
+        typer.echo(f"Target out of scope: {exc}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+
+    selected = tuple(c.strip() for c in checks.split(",") if c.strip())
+    scan_paths = [p.strip() for p in paths.split(",") if p.strip()] or ["/"]
+    targets = [DataExposureTarget(path=p, method=method) for p in scan_paths]
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                auth = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                auth.add_identity("primary", username=username, password=password)
+                token = await auth.login("primary")
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            try:
+                module = DataExposureModule(
+                    client,
+                    base_url=target,
+                    targets=targets,
+                    checks=selected,
+                    entropy_threshold=entropy_threshold,
+                    entropy_min_len=entropy_min_len,
+                    headers=headers,
+                    safe=sc.safe_mode,
+                )
+            except ValueError as exc:
+                typer.echo(f"Invalid configuration: {exc}")
+                raise typer.Exit(code=1)
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Data exposure scan failed: {exc}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Data exposure checks done: {len(result.findings)} finding(s) recorded "
         f"(total in DB: {summary['total']}); {result.requests_made} requests."
     )
     for f in result.findings:
