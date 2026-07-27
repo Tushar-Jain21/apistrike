@@ -1,6 +1,6 @@
 """APIStrike command-line interface (Typer).
 
-Commands: version, init-scope, scan, bola, bfla, inject, ssrf, crawl, recon, login, report.
+Commands: version, init-scope, scan, bola, bfla, inject, ssrf, massassign, crawl, recon, login, report.
 
 - crawl  : active recon -- discover shadow/undocumented endpoints, enumerate
            HTTP methods, and fuzz for hidden query params (API9:2023).
@@ -23,6 +23,11 @@ Commands: version, init-scope, scan, bola, bfla, inject, ssrf, crawl, recon, log
            built-in out-of-band OAST callback listener, cloud-metadata
            reachability, and timing. Probes are read-only (safe by default).
            Use --selftest to prove the OAST loop with no target.
+- massassign : Mass assignment / Broken Object Property Level Authorization
+           (API3:2023) -- smuggle privileged properties (admin, role, balance,
+           ...) into a create request, then read the object back to confirm the
+           value persisted. A control object rules out server-side defaults, so
+           false positives stay near zero.
 
 Every network call is routed through the scope-gated ScopedHTTPClient, so an
 out-of-scope target is refused before any request is made.
@@ -699,6 +704,125 @@ def ssrf(
         typer.echo(f"  - {note}")
     typer.echo(
         f"SSRF checks done: {len(result.findings)} finding(s) recorded "
+        f"(total in DB: {summary['total']}); {result.requests_made} requests."
+    )
+    for f in result.findings:
+        typer.echo(f"  [{f.severity.upper()}] {f.title}")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
+@app.command()
+def massassign(
+    target: str = typer.Argument(..., help="Base URL of the API to test."),
+    create_path: str = typer.Option("/users/v1/register", "--create-path", help="Endpoint that creates the object."),
+    id_field: str = typer.Option("username", "--id-field", help="Field in --base that identifies the created object on read-back."),
+    base: str = typer.Option(
+        '{"username": "apistrike_ma", "password": "Str1ke_P@ss", "email": "apistrike_ma@example.com"}',
+        "--base",
+        help="JSON object with the legitimate required fields for creation.",
+    ),
+    create_method: str = typer.Option("POST", "--create-method", help="HTTP method for creation."),
+    create_location: str = typer.Option("json", "--create-location", help="Where the body goes: 'json' or 'query'."),
+    readback_path: str = typer.Option("/users/v1/_debug", "--readback-path", help="Endpoint to read the object back. Empty string disables read-back (echo-only). For location 'path', include the INJECT marker."),
+    readback_location: str = typer.Option("none", "--readback-location", help="'none' (list/debug endpoint) or 'path' (per-object endpoint using the INJECT marker)."),
+    props: str = typer.Option("admin", "--props", help="Comma-separated property names to smuggle, or a JSON object of name:value. Known names get sensible values automatically."),
+    username: str = typer.Option("", "--username", "-u", help="Optional username; if set, logs in and tests with a Bearer token."),
+    password: str = typer.Option("", "--password", "-p", help="Optional password for --username."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+) -> None:
+    """Mass assignment / BOPLA (API3:2023): smuggle privileged props, confirm via read-back."""
+    import asyncio
+    import json as _json
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.modules.mass_assignment import (
+        MassAssignmentModule,
+        MassAssignmentTarget,
+        PRIVILEGE_PROPS,
+    )
+
+    try:
+        base_body = _json.loads(base)
+    except Exception:
+        typer.echo("--base must be valid JSON, e.g. '" + '{"username": "x", "password": "y", "email": "x@e.com"}' + "'")
+        raise typer.Exit(code=1)
+
+    parsed_props = None
+    ptext = props.strip()
+    if ptext:
+        if ptext.startswith("{"):
+            try:
+                parsed_props = _json.loads(ptext)
+            except Exception:
+                typer.echo("--props JSON is invalid.")
+                raise typer.Exit(code=1)
+        else:
+            parsed_props = {}
+            for name in [p.strip() for p in ptext.split(",") if p.strip()]:
+                parsed_props[name] = PRIVILEGE_PROPS.get(name, True)
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as exc:
+        typer.echo(f"Refused: {exc}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}.")
+    typer.echo(
+        f"Testing mass assignment at {create_method.upper()} {create_path}; "
+        f"read-back via {readback_path or '(none)'}. This creates throwaway objects."
+    )
+
+    async def _run(store):
+        async with ScopedHTTPClient(sc) as client:
+            headers = {}
+            if username and password:
+                engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                ident = engine.add_identity(username, username=username, password=password)
+                token = await engine.login(ident)
+                headers = {"Authorization": f"Bearer {token}"}
+                typer.echo(f"Authenticated as {username}; testing with a Bearer token.")
+            try:
+                tgt = MassAssignmentTarget(
+                    create_path=create_path,
+                    id_field=id_field,
+                    base_body=base_body,
+                    create_method=create_method,
+                    create_location=create_location,
+                    readback_path=readback_path,
+                    readback_location=readback_location,
+                    props=parsed_props,
+                    headers=headers,
+                )
+            except ValueError as exc:
+                typer.echo(f"Invalid target configuration: {exc}")
+                raise typer.Exit(code=1)
+            module = MassAssignmentModule(client, base_url=target, targets=[tgt], safe=sc.safe_mode)
+            return await module.run(store=store)
+
+    try:
+        with FindingsStore(settings.findings_db) as store:
+            result = asyncio.run(_run(store))
+            summary = store.summary()
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Mass assignment scan failed: {exc}")
+        raise typer.Exit(code=1)
+
+    for note in result.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(
+        f"Mass assignment checks done: {len(result.findings)} finding(s) recorded "
         f"(total in DB: {summary['total']}); {result.requests_made} requests."
     )
     for f in result.findings:
