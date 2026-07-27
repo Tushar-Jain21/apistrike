@@ -1,9 +1,11 @@
 """APIStrike command-line interface (Typer).
 
-Phase 1 skeleton + Phase 2 recon: version, init-scope, scan (stub), report, and
-now `recon` which parses an OpenAPI/Swagger spec and lists its endpoints. The
-vulnerability modules are wired in during later phases. Nothing here attacks
-anything -- scan only validates scope and prepares the findings DB.
+Phase 1 skeleton + Phase 2 recon & auth: version, init-scope, scan (stub),
+report, `recon` (parse an OpenAPI/Swagger spec and list endpoints), and now
+`login` (authenticate against a target and show the captured token + decoded
+JWT claims, read-only). The vulnerability modules are wired in during later
+phases. Nothing here attacks anything -- scan only validates scope and prepares
+the findings DB; login only performs the API's own login call.
 """
 from __future__ import annotations
 
@@ -98,6 +100,58 @@ def recon(
             flags.append("auth")
         suffix = f"  [{'; '.join(flags)}]" if flags else ""
         typer.echo(f"  {e.method:<6} {e.path}{suffix}")
+
+
+@app.command()
+def login(
+    target: str = typer.Argument(..., help="Base URL of the API to authenticate against."),
+    username: str = typer.Option(..., "--username", "-u", help="Username to log in with."),
+    password: str = typer.Option(..., "--password", "-p", help="Password to log in with."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+) -> None:
+    """Log in to a target API and show the captured token + decoded JWT (read-only)."""
+    import asyncio
+    import json as _json
+
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig, decode_jwt
+    from apistrike.core.http_client import ScopedHTTPClient
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        sc.assert_in_scope(target)
+    except OutOfScopeError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=2)
+
+    async def _run() -> str:
+        async with ScopedHTTPClient(sc) as client:
+            engine = AuthEngine(
+                client, base_url=target, login_config=LoginConfig(login_path=login_path)
+            )
+            ident = engine.add_identity(username, username=username, password=password)
+            return await engine.login(ident)
+
+    try:
+        token = asyncio.run(_run())
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Login failed: {e}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Logged in as {username}. Token captured ({len(token)} chars).")
+    typer.echo(token)
+    try:
+        decoded = decode_jwt(token)
+        typer.echo("Decoded JWT (unverified -- inspection only):")
+        typer.echo(f"  header:  {_json.dumps(decoded['header'])}")
+        typer.echo(f"  payload: {_json.dumps(decoded['payload'])}")
+    except ValueError:
+        typer.echo("(Token is not a decodable JWT -- stored as an opaque token.)")
 
 
 @app.command()
