@@ -28,7 +28,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libpango-1.0-0 libpangocairo-1.0-0 libpangoft2-1.0-0 \
             libharfbuzz0b libgdk-pixbuf-2.0-0 libcairo2 libffi-dev \
-            libjpeg62-turbo shared-mime-info fonts-dejavu-core
+            shared-mime-info fonts-dejavu-core
 
       - name: Install Python dependencies
         run: |
@@ -84,7 +84,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libpango-1.0-0 libpangocairo-1.0-0 libpangoft2-1.0-0 \
             libharfbuzz0b libgdk-pixbuf-2.0-0 libcairo2 libffi-dev \
-            libjpeg62-turbo shared-mime-info fonts-dejavu-core
+            shared-mime-info fonts-dejavu-core
 
       - name: Install Python dependencies
         run: |
