@@ -6,3 +6,4 @@ openapi-spec-validator
 pyjwt
 jinja2
 pytest
+weasyprint>=60
