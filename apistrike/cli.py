@@ -334,13 +334,29 @@ def login(
 def report(
     output: str = typer.Option("reports/report.md", help="Where to write the report."),
     target: str = typer.Option("N/A", help="Target label for the report header."),
+    fmt: str = typer.Option("md", "--format", "-f", help="Report format: md, html, or pdf."),
 ) -> None:
-    """Generate a Markdown report from the findings database."""
+    """Generate a report (Markdown / HTML / PDF) from the findings database."""
+    fmt = fmt.lower()
+    if fmt not in ("md", "markdown", "html", "pdf"):
+        typer.echo(f"Unknown --format {fmt!r} (choose md, html, or pdf).")
+        raise typer.Exit(code=1)
+    if output == "reports/report.md" and fmt not in ("md", "markdown"):
+        output = f"reports/report.{fmt}"
     settings = Settings.load()
     with FindingsStore(settings.findings_db) as store:
-        path = write_report(store, output, target=target)
+        if fmt in ("md", "markdown"):
+            path = write_report(store, output, target=target)
+        else:
+            from apistrike.reporting.html_report import (
+                write_report as write_rich, WeasyPrintNotInstalled,
+            )
+            try:
+                path = write_rich(store, output, target=target, fmt=fmt)
+            except WeasyPrintNotInstalled as exc:
+                typer.echo(str(exc))
+                raise typer.Exit(code=1)
     typer.echo(f"Report written to {path}")
-
 
 @app.command()
 def crawl(
@@ -1310,6 +1326,7 @@ def ai_report(
     target: str = typer.Option("N/A", help="Target label for the report header."),
     model: str = typer.Option("llama3", "--model", help="Ollama model to use."),
     ollama_url: str = typer.Option("http://localhost:11434", "--ollama-url", help="Ollama server URL."),
+    fmt: str = typer.Option("md", "--format", "-f", help="Report format: md, html, or pdf."),
 ) -> None:
     """AI Reporter: executive summary + narratives + exploit chains from the findings DB."""
     import asyncio
@@ -1318,6 +1335,13 @@ def ai_report(
     from apistrike.ai.provider import load_provider
     from apistrike.ai.analyst import AIAnalyst
     from apistrike.ai.reporter import AIReporter, _fv
+
+    fmt = fmt.lower()
+    if fmt not in ("md", "markdown", "html", "pdf"):
+        typer.echo(f"Unknown --format {fmt!r} (choose md, html, or pdf).")
+        raise typer.Exit(code=1)
+    if output == "reports/ai_report.md" and fmt not in ("md", "markdown"):
+        output = f"reports/ai_report.{fmt}"
 
     settings = Settings.load()
     provider, notes = load_provider(model=model, base_url=ollama_url)
@@ -1341,6 +1365,25 @@ def ai_report(
         return analysis, enrichment
 
     analysis, enrichment = asyncio.run(_run())
+
+
+    if fmt in ("html", "pdf"):
+        from apistrike.reporting.html_report import (
+            write_report as write_rich, WeasyPrintNotInstalled,
+        )
+        summary_text = enrichment.exec_summary or ""
+        if analysis.chains:
+            summary_text += "  Exploit chains: " + "; ".join(analysis.chains) + "."
+        try:
+            path = write_rich(findings, output, target=target, fmt=fmt,
+                          exec_summary=summary_text, model=model)
+        except WeasyPrintNotInstalled as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(code=1)
+        for n in enrichment.notes + analysis.notes:
+            typer.echo("  " + n)
+        typer.echo(f"AI report written to {path} ({len(findings)} findings, {len(analysis.chains)} chain(s) detected).")
+        return
 
     SEV = ("critical", "high", "medium", "low", "info")
     lines = [
