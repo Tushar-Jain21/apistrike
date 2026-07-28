@@ -6,3 +6,4 @@ findings.db
 reports/
 *.log
 scope.yaml
+wordlists/
