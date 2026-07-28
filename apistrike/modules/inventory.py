@@ -18,6 +18,10 @@ false positives. Every probe is a read-only GET — safe by default.
 Content-sensitive surfaces (.env, .git/config, actuator/env, phpinfo, ...) are
 additionally *content-verified*: a catch-all / SPA server that returns an HTML
 page (HTTP 200) for an unknown dotfile path no longer produces a false HIGH.
+
+Static file artifacts (.env, .git/config) are only reported on a verified
+HTTP 200 body: a 401/403/redirect means the file is correctly blocked (the
+opposite of a leak), so it is never flagged.
 """
 from __future__ import annotations
 
@@ -89,6 +93,14 @@ CONTENT_SIGNATURES: Dict[str, "re.Pattern[str]"] = {
     "/actuator/env": re.compile(r'"(propertySources|activeProfiles)"'),
     "/phpinfo.php": re.compile(r"phpinfo\(\)|PHP Version", re.IGNORECASE),
 }
+
+# Static file artifacts whose ONLY risk is the file *contents* being
+# downloadable. Unlike application surfaces (actuator, console, admin), a
+# 401 / 403 / redirect on these means the file is correctly blocked — the
+# opposite of a finding — so they are reported only on a verified HTTP 200
+# body. This fixes the false HIGH where a web server (e.g. LiteSpeed/Apache)
+# returns 403 for /.git/config yet the file is not actually exposed.
+STATIC_LEAK_PATHS = {"/.env", "/.git/config"}
 
 
 def _content_verified(path: str, body: str) -> bool:
@@ -237,9 +249,25 @@ class InventoryModule:
                 continue
             body = _body_str(resp)
             status = int(getattr(resp, "status_code", 0) or 0)
-            # A protected/error response (401/403/405/500) already proves the
-            # resource exists, so only content-verify inspectable success bodies.
-            if status not in (401, 403, 405, 500) and not _content_verified(path, body):
+            protected = status in (401, 403, 405, 500)
+            if path in STATIC_LEAK_PATHS:
+                # Static file artifacts: the finding is that the file *contents*
+                # are downloadable. Require a verified HTTP 200 body. A blocked
+                # (401/403/405/500), redirected (3xx) or catch-all/SPA HTML
+                # response means the file is NOT exposed — do not flag it.
+                verified = (200 <= status < 300) and _content_verified(path, body)
+                if not verified:
+                    if protected or status < 200 or status >= 300:
+                        reason = "blocked/protected (HTTP " + str(status) + ")"
+                    else:
+                        reason = ("body did not match the expected " + label
+                                  + " signature — likely a catch-all/SPA page")
+                    notes.append("Skipped " + path + ": not exposed — " + reason + ".")
+                    continue
+            elif status not in (401, 403, 405, 500) and not _content_verified(path, body):
+                # Application/presence surfaces: a protected/error response still
+                # proves the resource exists, so only content-verify inspectable
+                # success bodies (rejects catch-all/SPA HTML pages).
                 notes.append(
                     "Skipped " + path + " (responded but body did not match the expected "
                     + label + " signature — likely a catch-all/SPA page, not the real artifact)."

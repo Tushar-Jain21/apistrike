@@ -9,6 +9,7 @@ import pytest
 from apistrike.modules.inventory import (
     InventoryModule,
     DEFAULT_SURFACES,
+    STATIC_LEAK_PATHS,
     _looks_present,
     _versions_in,
 )
@@ -79,6 +80,56 @@ def test_surface_no_false_positive_on_404():
     assert any("No improper-inventory" in n for n in res.notes)
 
 
+# --- regression: static-file artifacts (.env / .git/config) ------------------
+
+def test_git_config_403_not_flagged():
+    """A server that blocks dotfiles returns 403 for /.git/config. 403 means
+    the file is protected (NOT exposed) and must not produce a finding."""
+    client = FakeClient({"/.git/config": (403, "Forbidden")})
+    m = InventoryModule(client, BASE, checks=("surfaces",))
+    res = run(m.run())
+    assert not any("git metadata" in f.title.lower() for f in res.findings)
+    assert any("/.git/config" in n and "not exposed" in n for n in res.notes)
+
+
+def test_git_config_200_html_not_flagged():
+    """SPA/catch-all returns 200 HTML for /.git/config -> not the real artifact."""
+    client = FakeClient({"/.git/config": (200, "<!doctype html><html><body>app</body></html>")})
+    m = InventoryModule(client, BASE, checks=("surfaces",))
+    res = run(m.run())
+    assert not any("git metadata" in f.title.lower() for f in res.findings)
+
+
+def test_git_config_200_real_flagged():
+    """A genuinely exposed git config (HTTP 200 + signature) is still HIGH."""
+    client = FakeClient({"/.git/config": (200, "[core]\n\trepositoryformatversion = 0\n\tbare = false\n")})
+    m = InventoryModule(client, BASE, checks=("surfaces",))
+    res = run(m.run())
+    assert any(f.severity == "high" and "git metadata" in f.title.lower() for f in res.findings)
+
+
+def test_env_403_not_flagged():
+    """A blocked /.env (403) is protected, not a leak."""
+    client = FakeClient({"/.env": (403, "Forbidden")})
+    m = InventoryModule(client, BASE, checks=("surfaces",))
+    res = run(m.run())
+    assert not any("Environment" in f.title for f in res.findings)
+
+
+def test_env_redirect_not_flagged():
+    """A redirect (302) on /.env is not an exposed file."""
+    client = FakeClient({"/.env": (302, "")})
+    m = InventoryModule(client, BASE, checks=("surfaces",))
+    res = run(m.run())
+    assert not any("Environment" in f.title for f in res.findings)
+
+
+def test_static_leak_paths_are_known():
+    assert "/.env" in STATIC_LEAK_PATHS and "/.git/config" in STATIC_LEAK_PATHS
+
+
+# --- versions ----------------------------------------------------------------
+
 def test_version_discovery_v2():
     client = FakeClient({"/users/v2/users": (200, '{"users":[]}')})
     m = InventoryModule(client, BASE, documented_paths=["/users/v1/users"], checks=("versions",), max_version=3)
@@ -110,7 +161,7 @@ def test_version_skipped_without_paths():
 
 
 def test_catchall_no_false_positive():
-    body = "<html>welcome</html>"
+    body = " welcome "
     client = FakeClient({}, default=(200, body))
     m = InventoryModule(client, BASE, checks=("surfaces",))
     res = run(m.run())
@@ -135,8 +186,10 @@ def test_store_persist_called():
     class Store:
         def __init__(self):
             self.items = []
+
         def add(self, f):
             self.items.append(f)
+
     client = FakeClient({"/openapi.json": (200, '{"x":1}'), "/.env": (200, "A=1")})
     m = InventoryModule(client, BASE, checks=("surfaces",))
     store = Store()
