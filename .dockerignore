@@ -1,0 +1,20 @@
+# Keep the build context small + reproducible
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+findings.db
+reports/
+*.log
+labs/
+wordlists/
+*.egg-info/
+dist/
+build/
+.DS_Store
