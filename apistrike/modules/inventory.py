@@ -102,6 +102,19 @@ def _content_verified(path: str, body: str) -> bool:
     return bool(sig.search(body or ""))
 
 
+def _evidence_snippet(body: str, limit: int = 180) -> str:
+    """A short, whitespace-collapsed, value-masked preview of a response body,
+    so surface findings are self-adjudicating in the report/DB (real artifact
+    vs. benign catch-all page) without dumping full secrets."""
+    if not body:
+        return "(empty body)"
+    text = body[:limit]
+    # Mask the value side of KEY=VALUE pairs so we never store full secrets.
+    text = re.sub(r"(=)([^\s]{3,})", lambda m: m.group(1) + m.group(2)[:2] + "\u2026", text)
+    collapsed = " ".join(text.split())
+    return collapsed + ("\u2026" if len(body) > limit else "")
+
+
 @dataclass
 class InventoryResult:
     findings: List[Finding] = field(default_factory=list)
@@ -232,6 +245,7 @@ class InventoryModule:
                     + label + " signature — likely a catch-all/SPA page, not the real artifact)."
                 )
                 continue
+            snippet = _evidence_snippet(body)
             findings.append(Finding(
                 title="Exposed surface: " + label + " (" + path + ")",
                 severity=severity, owasp_id=OWASP_ID, endpoint="GET " + path,
@@ -239,7 +253,7 @@ class InventoryModule:
                 cwe=cwe,
                 recommendation="Remove or authenticate this surface in production; keep an accurate inventory of what is exposed.",
                 confidence="firm",
-                evidence=[path + " -> HTTP " + str(status)],
+                evidence=[path + " -> HTTP " + str(status), "body[:180]: " + snippet],
             ))
 
     async def run(self, store=None) -> InventoryResult:
