@@ -3,17 +3,21 @@
 Complements the active crawler by focusing on *inventory* problems rather than
 raw endpoint discovery:
 
-  * versions  : given documented version-bearing paths (e.g. /users/v1/users),
-                probe sibling versions (v0, v2, v3, ...). Any version that
-                answers but is not documented is an undocumented / old /
-                "zombie" API version still reachable.
-  * surfaces  : probe a curated list of non-production and documentation
-                surfaces (OpenAPI/Swagger specs, GraphQL consoles, actuator,
-                .env, debug/console, metrics, ...). Anything live is flagged
-                with a severity appropriate to how sensitive it is.
+* versions  : given documented version-bearing paths (e.g. /users/v1/users),
+              probe sibling versions (v0, v2, v3, ...). Any version that
+              answers but is not documented is an undocumented / old /
+              "zombie" API version still reachable.
+* surfaces  : probe a curated list of non-production and documentation
+              surfaces (OpenAPI/Swagger specs, GraphQL consoles, actuator,
+              .env, debug/console, metrics, ...). Anything live is flagged
+              with a severity appropriate to how sensitive it is.
 
 A soft-404 baseline is calibrated first so catch-all servers don't produce
 false positives. Every probe is a read-only GET — safe by default.
+
+Content-sensitive surfaces (.env, .git/config, actuator/env, phpinfo, ...) are
+additionally *content-verified*: a catch-all / SPA server that returns an HTML
+page (HTTP 200) for an unknown dotfile path no longer produces a false HIGH.
 """
 from __future__ import annotations
 
@@ -61,6 +65,41 @@ DEFAULT_SURFACES: List[Tuple[str, str, str, str]] = [
     ("/server-status", "medium", "Apache server-status", "CWE-200"),
     ("/phpinfo.php", "high", "phpinfo()", "CWE-200"),
 ]
+
+
+def _looks_like_html(body: str) -> bool:
+    """True if the body looks like an HTML document (SPA / catch-all page)."""
+    head = (body or "")[:600].lstrip().lower()
+    return (
+        head.startswith("<!doctype html")
+        or head.startswith("<html")
+        or "<head" in head
+        or "<body" in head
+    )
+
+
+# Paths whose *presence* is not sufficient evidence: the response body must
+# actually look like the sensitive artifact before we flag it. This removes
+# the common false positive where a SPA / catch-all server answers HTTP 200
+# with an HTML page for an unknown dotfile path (e.g. crAPI's gateway + /.env).
+CONTENT_SIGNATURES: Dict[str, "re.Pattern[str]"] = {
+    "/.env": re.compile(r"^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=", re.MULTILINE),
+    "/.git/config": re.compile(r"\[core\]|repositoryformatversion", re.IGNORECASE),
+    "/actuator": re.compile(r'"_links"'),
+    "/actuator/env": re.compile(r'"(propertySources|activeProfiles)"'),
+    "/phpinfo.php": re.compile(r"phpinfo\(\)|PHP Version", re.IGNORECASE),
+}
+
+
+def _content_verified(path: str, body: str) -> bool:
+    """For content-sensitive surfaces, require a matching body signature and
+    reject HTML documents. Paths without a signature are unaffected."""
+    sig = CONTENT_SIGNATURES.get(path)
+    if sig is None:
+        return True
+    if _looks_like_html(body):
+        return False
+    return bool(sig.search(body or ""))
 
 
 @dataclass
@@ -181,17 +220,27 @@ class InventoryModule:
     async def _check_surfaces(self, findings: List[Finding], notes: List[str]) -> None:
         for path, severity, label, cwe in self.surface_paths:
             resp = await self._get(path)
-            if self._present(resp):
-                status = int(getattr(resp, "status_code", 0) or 0)
-                findings.append(Finding(
-                    title="Exposed surface: " + label + " (" + path + ")",
-                    severity=severity, owasp_id=OWASP_ID, endpoint="GET " + path,
-                    description="A " + label + " is reachable at " + path + " (HTTP " + str(status) + "). Documentation, debug, and management surfaces should not be exposed in production and expand the attack surface / inventory blind spots.",
-                    cwe=cwe,
-                    recommendation="Remove or authenticate this surface in production; keep an accurate inventory of what is exposed.",
-                    confidence="firm",
-                    evidence=[path + " -> HTTP " + str(status)],
-                ))
+            if not self._present(resp):
+                continue
+            body = _body_str(resp)
+            status = int(getattr(resp, "status_code", 0) or 0)
+            # A protected/error response (401/403/405/500) already proves the
+            # resource exists, so only content-verify inspectable success bodies.
+            if status not in (401, 403, 405, 500) and not _content_verified(path, body):
+                notes.append(
+                    "Skipped " + path + " (responded but body did not match the expected "
+                    + label + " signature — likely a catch-all/SPA page, not the real artifact)."
+                )
+                continue
+            findings.append(Finding(
+                title="Exposed surface: " + label + " (" + path + ")",
+                severity=severity, owasp_id=OWASP_ID, endpoint="GET " + path,
+                description="A " + label + " is reachable at " + path + " (HTTP " + str(status) + "). Documentation, debug, and management surfaces should not be exposed in production and expand the attack surface / inventory blind spots.",
+                cwe=cwe,
+                recommendation="Remove or authenticate this surface in production; keep an accurate inventory of what is exposed.",
+                confidence="firm",
+                evidence=[path + " -> HTTP " + str(status)],
+            ))
 
     async def run(self, store=None) -> InventoryResult:
         result = InventoryResult()

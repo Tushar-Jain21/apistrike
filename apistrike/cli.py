@@ -111,6 +111,10 @@ def scan(
     username: str = typer.Option("", "--username", "-u", help="Username for auth-based checks."),
     password: str = typer.Option("", "--password", "-p", help="Password for auth-based checks."),
     login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    login_field: str = typer.Option(
+        "username", "--login-field",
+        help="Body field name for the identity on login (e.g. 'email' for crAPI).",
+    ),
     probe_path: str = typer.Option("/me", help="Authenticated endpoint used to test tampered tokens."),
 ) -> None:
     """Run a scan: validate scope, then (with -u/-p) run the broken-auth module."""
@@ -147,7 +151,7 @@ def scan(
     async def _run(store):
         async with ScopedHTTPClient(sc) as client:
             engine = AuthEngine(
-                client, base_url=target, login_config=LoginConfig(login_path=login_path)
+                client, base_url=target, login_config=LoginConfig(login_path=login_path, username_field=login_field)
             )
             ident = engine.add_identity(username, username=username, password=password)
             token = await engine.login(ident)
