@@ -1,0 +1,56 @@
+# Changelog
+
+All notable changes to **APIStrike** are documented here.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.0.0] — 2026-07-28
+
+First stable release. A modular, AI-assisted, fully open-source automated API
+penetration-testing framework covering the OWASP API Security Top 10 (2023),
+validated live against **VAmPI** and **crAPI** in CI.
+
+### Core engine
+- Scope loader (`scope.yaml`): allowed-hosts allowlist, rate caps, safe mode — gates every request.
+- Async HTTP client wrapper (httpx) with a scope-enforcing `ScopedHTTPClient`.
+- SQLite findings store with OWASP + CWE mapping.
+- Typer CLI with a command per module.
+- Markdown / HTML / PDF reporting (Jinja2 + WeasyPrint).
+
+### Recon & auth
+- OpenAPI 3.x / Swagger 2.0 parser (URL or file, JSON or YAML).
+- Active crawler: soft-404 calibration, shadow/undocumented-endpoint discovery, method enumeration, param fuzzing.
+- Multi-identity auth engine (Bearer / JWT / API key) with scope-gated login and JWT decode.
+
+### Vulnerability modules (OWASP API Security Top 10 — 2023)
+- **API1 BOLA** — multi-user token diffing, unauth read, opt-in id enumeration, body-match confirmation.
+- **API2 Broken Auth** — JWT `alg:none`, weak-secret, and expiry tampering (stdlib-only crypto).
+- **API3 Mass Assignment** — privileged-property smuggling with control-object read-back confirmation.
+- **API3 Excessive Data Exposure** — secrets / sensitive-field / PII (Luhn-checked) / entropy scan, all evidence masked.
+- **API4 Resource Consumption** — bounded burst + pagination abuse, capped by scope `max_requests`.
+- **API5 BFLA** — role-based access matrix with optional admin baseline; destructive verbs behind `--active`.
+- **API7 SSRF** — built-in stdlib OAST listener + metadata/internal-reachability/timing techniques.
+- **API8 Misconfiguration** — security headers, permissive CORS, verbose errors, HTTP TRACE, version banners.
+- **API9 Improper Inventory** — version/zombie discovery + ~25 curated exposed-surface probes with content-signature verification.
+- **GraphQL** — introspection, field-suggestion leakage, query batching, GET-based mutations.
+- **Injection** — error/boolean/time-based SQLi, OS-command, and NoSQL operator injection across query/body/path.
+
+### AI layer (model-agnostic, local-first)
+- Pluggable `AIProvider` (Ollama default, NoOp + Mock) with daemon/model state detection.
+- AI Planner (spec-driven strategy + heuristic fallback), AI Analyst (false-positive review + exploit chaining), AI Reporter (exec summary + remediation).
+- Hard guardrail: AI proposes, the deterministic engine confirms every finding with a real request; AI never creates or mutates a finding.
+
+### Release engineering
+- Dockerfile (non-root, WeasyPrint native libs) + Makefile one-command runs.
+- GitHub Actions CI: full pytest suite, Buildx image build + entrypoint smoke, and a live VAmPI lab scan uploading reports + `findings.db`.
+- Opt-in crAPI validation workflow (weekly cron + manual dispatch) standing up the full crAPI stack.
+- Plugin API (`apistrike/plugins/`) with entry-point discovery + `run-module` command; `CONTRIBUTING.md`; SecLists fetch script.
+
+### Validation highlights
+- **VAmPI:** confirmed true positives across BOLA, mass assignment, SQLi, rate limiting, data exposure, misconfig, and inventory — with zero false positives on hardened/clean endpoints.
+- **crAPI:** 6 confirmed findings including a **HIGH real `.env` exposure** leaking Postgres + Mongo credentials at `/.env` (content-verified true positive); ssrf/graphql/dataexpose correctly returned no false positives.
+
+### Tests
+- 230 passing tests.
+
+[1.0.0]: https://github.com/Tushar-Jain21/apistrike/releases/tag/v1.0.0
