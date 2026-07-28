@@ -1273,5 +1273,109 @@ def graphql(
     typer.echo("Run 'apistrike report' to generate the Markdown report.")
 
 
+@app.command("ai-plan")
+def ai_plan(
+    spec: str = typer.Argument(..., help="URL or path to an OpenAPI/Swagger spec."),
+    target: str = typer.Option("", "--target", help="Base URL label (overrides spec base URL in output)."),
+    model: str = typer.Option("llama3", "--model", help="Ollama model (e.g. llama3, mistral, qwen2)."),
+    ollama_url: str = typer.Option("http://localhost:11434", "--ollama-url", help="Ollama server URL."),
+) -> None:
+    """AI Planner: rank the top-5 riskiest endpoints (Ollama-powered or heuristic fallback)."""
+    import asyncio
+    from apistrike.ai.provider import load_provider
+    from apistrike.ai.planner import AIPlanner
+
+    api = load_spec(spec)
+    typer.echo(f"Spec: {api.title} v{api.version} -- {len(api)} endpoints.")
+    provider, notes = load_provider(model=model, base_url=ollama_url)
+    for n in notes:
+        typer.echo("  " + n)
+    result = asyncio.run(
+        AIPlanner(provider).plan(api.endpoints, title=api.title, base_url=target or api.base_url or "")
+    )
+    for n in result.notes:
+        typer.echo("  " + n)
+    if not result.items:
+        typer.echo("No plan generated.")
+        return
+    typer.echo(f"\nTest plan ({len(result.items)} target(s)):")
+    for item in result.items:
+        typer.echo(f"  {item.priority}. [{item.risk}] {item.endpoint}  ->  {item.module}")
+        typer.echo(f"     {item.reason}")
+
+
+@app.command("ai-report")
+def ai_report(
+    output: str = typer.Option("reports/ai_report.md", help="Where to write the enriched report."),
+    target: str = typer.Option("N/A", help="Target label for the report header."),
+    model: str = typer.Option("llama3", "--model", help="Ollama model to use."),
+    ollama_url: str = typer.Option("http://localhost:11434", "--ollama-url", help="Ollama server URL."),
+) -> None:
+    """AI Reporter: executive summary + narratives + exploit chains from the findings DB."""
+    import asyncio
+    import os
+    import datetime
+    from apistrike.ai.provider import load_provider
+    from apistrike.ai.analyst import AIAnalyst
+    from apistrike.ai.reporter import AIReporter, _fv
+
+    settings = Settings.load()
+    provider, notes = load_provider(model=model, base_url=ollama_url)
+    for n in notes:
+        typer.echo("  " + n)
+
+    with FindingsStore(settings.findings_db) as store:
+        findings = store.all()
+
+    if not findings:
+        typer.echo("No findings in the database. Run some scans first.")
+        raise typer.Exit(code=0)
+
+    typer.echo(f"Loaded {len(findings)} finding(s) from {settings.findings_db}.")
+
+    async def _run():
+        analysis = await AIAnalyst(provider).analyse(findings, target=target)
+        enrichment = await AIReporter(provider).enrich_report(
+            findings, target=target, date=datetime.date.today().isoformat()
+        )
+        return analysis, enrichment
+
+    analysis, enrichment = asyncio.run(_run())
+
+    SEV = ("critical", "high", "medium", "low", "info")
+    lines = [
+        f"# APIStrike AI Report -- {target}",
+        f"\n_Generated: {datetime.date.today().isoformat()} | Model: {model} | Findings: {len(findings)}_\n",
+        "## Executive Summary\n",
+        enrichment.exec_summary,
+    ]
+    if analysis.chains:
+        lines += ["\n## Exploit Chains\n"] + [f"- {c}" for c in analysis.chains]
+    if analysis.additional_checks:
+        lines += ["\n## Recommended Additional Checks\n"] + [f"- {c}" for c in analysis.additional_checks]
+    if analysis.false_positives:
+        lines += ["\n## Possible False Positives\n"] + [f"- {fp}" for fp in analysis.false_positives]
+    lines.append("\n## Findings\n")
+    for f in sorted(findings, key=lambda x: SEV.index(str(_fv(x, "severity", "info")).lower()) if str(_fv(x, "severity", "info")).lower() in SEV else 99):
+        title = _fv(f, "title", "")
+        oname = _fv(f, "owasp_name", "")
+        owasp = _fv(f, "owasp_id", "")
+        owasp_txt = f"{owasp} -- {oname}" if (owasp and oname) else (owasp or oname)
+        lines.append(f"### [{str(_fv(f, 'severity', '?')).upper()}] {title}")
+        lines.append(f"- **OWASP**: {owasp_txt} | **CWE**: {_fv(f,'cwe','')} | **Endpoint**: {_fv(f,'endpoint','')}")
+        narrative = enrichment.narratives.get(title, "")
+        if narrative:
+            lines.append(f"\n_{narrative}_")
+        lines.append("")
+
+    os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
+    with open(output, "w") as fh:
+        fh.write("\n".join(lines))
+
+    for n in enrichment.notes + analysis.notes:
+        typer.echo("  " + n)
+    typer.echo(f"AI report written to {output} ({len(findings)} findings, {len(analysis.chains)} chain(s) detected).")
+
+
 if __name__ == "__main__":
     app()
