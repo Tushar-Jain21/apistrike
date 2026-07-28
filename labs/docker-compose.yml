@@ -1,0 +1,14 @@
+# APIStrike test lab -- VAmPI (Vulnerable API)
+# Authorized target for APIStrike development. Runs entirely on localhost.
+# Source: https://github.com/erev0s/VAmPI (open source, GPL-3.0)
+services:
+  vampi:
+    image: erev0s/vampi:latest
+    container_name: apistrike-vampi
+    ports:
+      - "5000:5000"
+    environment:
+      # vulnerable=1 -> intentionally vulnerable mode (use for testing)
+      # vulnerable=0 -> secure mode (use later to confirm our fixes/false positives)
+      - vulnerable=1
+    restart: unless-stopped
