@@ -3,10 +3,10 @@
 Fetches selected endpoints and scans the response bodies for information an API
 should not be returning:
 
-  * secrets : private keys, cloud/API keys, JWTs, password hashes, DB URIs
-  * fields  : sensitive JSON properties (password, ssn, api_key, ...)
-  * pii     : emails, US SSNs, Luhn-valid payment card numbers
-  * entropy : high-entropy strings that look like tokens/secrets
+ * secrets : private keys, cloud/API keys, JWTs, password hashes, DB URIs
+ * fields : sensitive JSON properties (password, ssn, api_key, ...)
+ * pii : emails, US SSNs, Luhn-valid payment card numbers
+ * entropy : high-entropy strings that look like tokens/secrets
 
 All probes are read-only GET/inspection (safe by default). Evidence values are
 masked/redacted so the tool never re-prints a full secret.
@@ -56,6 +56,26 @@ HASH_RE = re.compile(r"^(?:\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}|[a-fA-F0-9]{32}|[a-
 
 _COMPILED_SECRETS = [(name, re.compile(pat), sev, cwe) for name, pat, sev, cwe in SECRET_PATTERNS]
 
+# --- entropy false-positive guards -------------------------------------------
+# The entropy heuristic is meant for API/JSON responses. When pointed at an
+# HTML page it used to flag inline SVG path coordinates, <script>/<style>
+# blobs, data: URIs and long asset filenames (e.g. timestamped image names) as
+# "possible secrets". None of those are secrets. We strip that markup for the
+# entropy pass only; the named-secret and field checks still run on the full
+# original body, so real leaks are never suppressed.
+_ASSET_EXT_RE = re.compile(
+    r"\.(?:png|jpe?g|gif|svg|webp|ico|bmp|avif|css|js|mjs|map|woff2?|ttf|otf|eot|"
+    r"json|html?|xml|txt|pdf|mp4|webm|mov|mp3|wav|zip|gz|woff)\b",
+    re.I,
+)
+_WORD_RUN_RE = re.compile(r"[A-Za-z]{12,}")
+_SVG_BLOCK_RE = re.compile(r"<svg\b[^>]*>.*?</svg>", re.I | re.S)
+_SCRIPT_BLOCK_RE = re.compile(r"<script\b[^>]*>.*?</script>", re.I | re.S)
+_STYLE_BLOCK_RE = re.compile(r"<style\b[^>]*>.*?</style>", re.I | re.S)
+_PATHDATA_RE = re.compile(r"\b[dD]\s*=\s*\"[^\"]*\"")
+_POINTS_RE = re.compile(r"\bpoints\s*=\s*\"[^\"]*\"")
+_DATAURI_RE = re.compile(r"data:[\w.+/-]+;base64,[A-Za-z0-9+/=]+", re.I)
+_NOISE_RES = (_SVG_BLOCK_RE, _SCRIPT_BLOCK_RE, _STYLE_BLOCK_RE, _DATAURI_RE, _PATHDATA_RE, _POINTS_RE)
 
 @dataclass
 class DataExposureTarget:
@@ -70,13 +90,11 @@ class DataExposureTarget:
         if not self.path.startswith("/"):
             self.path = "/" + self.path
 
-
 @dataclass
 class DataExposureResult:
     findings: List[Finding] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     requests_made: int = 0
-
 
 def _body_str(resp: Any) -> str:
     body = getattr(resp, "body", "") or ""
@@ -87,14 +105,12 @@ def _body_str(resp: Any) -> str:
             return str(body)
     return body if isinstance(body, str) else str(body)
 
-
 def _entropy(s: str) -> float:
     if not s:
         return 0.0
     counts = Counter(s)
     n = len(s)
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
-
 
 def _luhn_ok(digits: str) -> bool:
     if not digits.isdigit() or len(digits) < 13:
@@ -111,17 +127,14 @@ def _luhn_ok(digits: str) -> bool:
         alt = not alt
     return total % 10 == 0
 
-
 def _mask(value: Any, keep: int = 4) -> str:
     s = str(value)
     if len(s) <= keep:
         return "*" * len(s)
     return s[:keep] + "\u2026[redacted " + str(len(s) - keep) + " chars]"
 
-
 def _looks_hashed(value: Any) -> bool:
     return bool(HASH_RE.match(str(value).strip()))
-
 
 def _field_cwe(lk: str) -> str:
     if lk in ("password", "passwd", "pwd", "pass"):
@@ -129,7 +142,6 @@ def _field_cwe(lk: str) -> str:
     if lk in ("ssn", "social_security_number", "credit_card", "card_number", "cardnumber", "cvv", "cvc"):
         return "CWE-359"
     return "CWE-522"
-
 
 def _walk_json(obj: Any):
     if isinstance(obj, dict):
@@ -139,7 +151,6 @@ def _walk_json(obj: Any):
     elif isinstance(obj, list):
         for item in obj:
             yield from _walk_json(item)
-
 
 def _scan_secrets(endpoint: str, text: str) -> List[Finding]:
     out: List[Finding] = []
@@ -156,7 +167,6 @@ def _scan_secrets(endpoint: str, text: str) -> List[Finding]:
                 evidence=[name + ": " + _mask(match.group(0))],
             ))
     return out
-
 
 def _scan_fields(endpoint: str, parsed: Any) -> List[Finding]:
     out: List[Finding] = []
@@ -184,7 +194,6 @@ def _scan_fields(endpoint: str, parsed: Any) -> List[Finding]:
             evidence=[str(key) + ": " + (_mask(value) if not isinstance(value, (dict, list)) else "<" + type(value).__name__ + ">")],
         ))
     return out
-
 
 def _scan_pii(endpoint: str, text: str) -> List[Finding]:
     out: List[Finding] = []
@@ -227,18 +236,49 @@ def _scan_pii(endpoint: str, text: str) -> List[Finding]:
         ))
     return out
 
+def _strip_markup_noise(text: str) -> str:
+    """Remove markup that yields long non-secret pseudo-random strings.
+
+    Used by the entropy pass only. Strips inline SVG blocks, SVG path/points
+    coordinate data, <script>/<style> bodies and data: URIs so the heuristic
+    does not flag icon paths, minified assets or embedded images as secrets.
+    """
+    for rx in _NOISE_RES:
+        text = rx.sub(" ", text)
+    return text
+
+def _is_probable_secret(tok: str, threshold: float) -> bool:
+    """Heuristic: does this token look like a random secret/token?
+
+    Real secrets mix letters and digits, have high entropy, draw from a
+    diverse alphabet, and lack long readable word runs. Filenames and
+    slug-like identifiers (e.g. 'generated_image', 'untitleddesign') fail
+    these tests and are skipped.
+    """
+    if not (any(c.isalpha() for c in tok) and any(c.isdigit() for c in tok)):
+        return False
+    if _entropy(tok) < threshold:
+        return False
+    if _WORD_RUN_RE.search(tok):
+        return False
+    if len(set(tok)) < 12:
+        return False
+    return True
 
 def _scan_entropy(endpoint: str, text: str, threshold: float, min_len: int, exclude: set) -> List[Finding]:
+    scan_text = _strip_markup_noise(text)
     token_re = re.compile(r"[A-Za-z0-9_\-+/=]{" + str(int(min_len)) + ",}")
     flagged: List[str] = []
-    for tok in token_re.findall(text):
+    for m in token_re.finditer(scan_text):
+        tok = m.group(0)
         if tok in exclude or tok in flagged:
             continue
         if len(tok) < min_len:
             continue
-        has_alpha = any(c.isalpha() for c in tok)
-        has_digit = any(c.isdigit() for c in tok)
-        if has_alpha and has_digit and _entropy(tok) >= threshold:
+        # skip asset filenames: <token> immediately followed by a file extension
+        if _ASSET_EXT_RE.match(scan_text[m.end():m.end() + 8]):
+            continue
+        if _is_probable_secret(tok, threshold):
             flagged.append(tok)
     if not flagged:
         return []
@@ -251,7 +291,6 @@ def _scan_entropy(endpoint: str, text: str, threshold: float, min_len: int, excl
         confidence="firm",
         evidence=[_mask(t) for t in flagged[:5]],
     )]
-
 
 class DataExposureModule:
     def __init__(
