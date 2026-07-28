@@ -12,6 +12,7 @@ from apistrike.auth.auth_engine import AuthEngine, LoginConfig
 from apistrike.modules.inventory import (
     InventoryModule,
     _content_verified,
+    _evidence_snippet,
     _looks_like_html,
 )
 
@@ -87,6 +88,22 @@ def test_git_config_real_is_flagged():
     body = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
     res = _run_surfaces({"/.git/config": _Resp(200, body)})
     assert any(".git" in f.title for f in res.findings)
+
+
+def test_evidence_has_body_snippet():
+    res = _run_surfaces({"/.env": _Resp(200, REAL_ENV)})
+    env = [f for f in res.findings if "/.env" in f.title][0]
+    assert any(e.startswith("body[:180]:") for e in env.evidence)
+    joined = " ".join(env.evidence)
+    # secret values are masked, not dumped verbatim; keys stay visible
+    assert "supersecret" not in joined and "hunter2" not in joined
+    assert "SECRET_KEY" in joined
+
+
+def test_evidence_snippet_masks_values():
+    s = _evidence_snippet("API_KEY=abcdef\nMODE=prod")
+    assert "abcdef" not in s
+    assert "API_KEY=ab" in s
 
 
 def test_login_field_email_payload():

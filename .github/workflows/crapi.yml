@@ -89,7 +89,7 @@ jobs:
           echo "== crawl ==";      python -m apistrike crawl      "$BASE" --scope scope.crapi.yaml
           echo "== ratelimit ==";  python -m apistrike ratelimit  "$BASE" --scope scope.crapi.yaml
           echo "== dataexpose =="; python -m apistrike dataexpose "$BASE" --scope scope.crapi.yaml
-          echo "== ssrf ==";       python -m apistrike ssrf       "$BASE" --path / --scope scope.crapi.yaml
+          echo "== ssrf ==";       python -m apistrike ssrf       "$BASE" --path / --param url --no-oast --scope scope.crapi.yaml
           echo "== graphql ==";    python -m apistrike graphql    "$BASE" --scope scope.crapi.yaml
           set -e
 
