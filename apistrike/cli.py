@@ -73,6 +73,35 @@ from apistrike.reporting.report import write_report
 
 from apistrike import __version__
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def _run_store(settings, *, target, command, modules=None, scope_summary=None):
+    """Open the findings store as a durable scan run.
+
+    Begins a run (recording target / command / modules / scope) on entry and
+    finalises it on exit: ``completed`` on success, ``failed`` if the body
+    raises. This makes every scan a first-class, queryable run instead of an
+    anonymous pile of findings.
+    """
+    store = FindingsStore(settings.findings_db)
+    try:
+        store.begin_run(
+            target=target, command=command,
+            modules=modules, scope_summary=scope_summary,
+        )
+        yield store
+    except BaseException:
+        try:
+            store.finish_run(status="failed")
+        finally:
+            store.close()
+        raise
+    else:
+        store.finish_run(status="completed")
+        store.close()
+
 app = typer.Typer(
     add_completion=False,
     help="APIStrike -- AI-assisted, open-source API penetration testing.",
@@ -136,7 +165,7 @@ def scan(
 
     if not (username and password):
         with FindingsStore(settings.findings_db) as store:
-            summary = store.summary()
+            summary = store.summary(all_runs=True)
         typer.echo(
             f"No credentials given (-u/-p). Findings DB ready at {settings.findings_db} "
             f"({summary['total']} existing). Provide -u/-p to run the broken-auth module."
@@ -163,7 +192,10 @@ def scan(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="scan",
+                modules=["broken_auth"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
@@ -246,7 +278,10 @@ def bola(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="bola",
+                modules=["bola"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
@@ -342,6 +377,8 @@ def report(
     output: str = typer.Option("reports/report.md", help="Where to write the report."),
     target: str = typer.Option("N/A", help="Target label for the report header."),
     fmt: str = typer.Option("md", "--format", "-f", help="Report format: md, html, or pdf."),
+    run: str = typer.Option("", "--run", help="Render a specific run id (default: the latest run). Markdown only."),
+    all_runs: bool = typer.Option(False, "--all-runs", help="Render findings across all runs (historical view). Markdown only."),
 ) -> None:
     """Generate a report (Markdown / HTML / PDF) from the findings database."""
     fmt = fmt.lower()
@@ -353,7 +390,7 @@ def report(
     settings = Settings.load()
     with FindingsStore(settings.findings_db) as store:
         if fmt in ("md", "markdown"):
-            path = write_report(store, output, target=target)
+            path = write_report(store, output, target=target, run_id=(run or None), all_runs=all_runs)
         else:
             from apistrike.reporting.html_report import (
                 write_report as write_rich, WeasyPrintNotInstalled,
@@ -364,6 +401,30 @@ def report(
                 typer.echo(str(exc))
                 raise typer.Exit(code=1)
     typer.echo(f"Report written to {path}")
+
+
+@app.command("runs")
+def runs_cmd() -> None:
+    """List recorded scan runs (most recent first)."""
+    settings = Settings.load()
+    with FindingsStore(settings.findings_db) as store:
+        runs = store.runs()
+        if not runs:
+            typer.echo("No scan runs recorded yet. Run a scan to create one.")
+            raise typer.Exit(code=0)
+        typer.echo(f"{len(runs)} run(s) recorded (most recent first):")
+        for r in runs:
+            rid = r.get("run_id") or "?"
+            total = store.summary(run_id=rid).get("total", 0)
+            status = r.get("status") or "?"
+            target = r.get("target") or "?"
+            command = r.get("command") or ""
+            started = r.get("started_at") or "?"
+            cmd_txt = f" [{command}]" if command else ""
+            typer.echo(
+                f"  {rid}  {status:<9} {target}{cmd_txt}  "
+                f"started={started}  findings={total}"
+            )
 
 @app.command()
 def crawl(
@@ -437,7 +498,10 @@ def crawl(
             return await crawler.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="crawl",
+                modules=["crawler"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             res = asyncio.run(_run(store))
             summary = store.summary()
     except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
@@ -548,7 +612,10 @@ def bfla(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="bfla",
+                modules=["bfla"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
@@ -634,7 +701,10 @@ def inject(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="inject",
+                modules=["injection"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
@@ -743,7 +813,10 @@ def ssrf(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="ssrf",
+                modules=["ssrf"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except Exception as exc:  # noqa: BLE001 -- surface a clean CLI error
@@ -864,7 +937,10 @@ def massassign(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="massassign",
+                modules=["mass_assignment"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except typer.Exit:
@@ -950,7 +1026,10 @@ def misconfig(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="misconfig",
+                modules=["misconfig"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except typer.Exit:
@@ -1059,7 +1138,10 @@ def run_module(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="run-module",
+                modules=[name], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except typer.Exit:
@@ -1141,7 +1223,10 @@ def dataexpose(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="dataexpose",
+                modules=["data_exposure"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except typer.Exit:
@@ -1233,7 +1318,10 @@ def ratelimit(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="ratelimit",
+                modules=["rate_limit"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except typer.Exit:
@@ -1314,7 +1402,10 @@ def inventory(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="inventory",
+                modules=["inventory"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except ValueError as e:
@@ -1388,7 +1479,10 @@ def graphql(
             return await module.run(store=store)
 
     try:
-        with FindingsStore(settings.findings_db) as store:
+        with _run_store(
+                settings, target=target, command="graphql",
+                modules=["graphql"], scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
             result = asyncio.run(_run(store))
             summary = store.summary()
     except ValueError as e:

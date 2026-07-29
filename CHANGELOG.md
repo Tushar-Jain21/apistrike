@@ -4,6 +4,15 @@ All notable changes to **APIStrike** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-07-29
+
+### Added
+- `runs` command: list recorded scan runs (id, status, target, command, start time, finding count).
+- `report --run <id>` and `report --all-runs` to scope the Markdown report to a specific run or the full history.
+
+### Changed
+- Every scan-type command now opens a durable scan run via a shared `_run_store` context manager, recording the real target, command and module(s) and marking the run `completed` or `failed`. This replaces the implicit `(default)`/`(implicit)` run for CLI-driven scans.
+
 ## [1.2.0] -- 2026-07-29
 
 ### Added
