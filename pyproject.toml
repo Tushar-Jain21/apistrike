@@ -50,3 +50,19 @@ path = "apistrike/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["apistrike"]
+
+[tool.importlinter]
+root_package = "apistrike"
+
+# Architectural boundary. Higher layers may import lower ones, never the
+# reverse: the CLI may use modules and core; modules may use core; but core
+# must never import modules or the CLI, and modules must never import the CLI.
+# Keeps the engine (core) and detection modules reusable and CLI-free.
+[[tool.importlinter.contracts]]
+name = "Layered architecture (cli -> modules -> core)"
+type = "layers"
+layers = [
+    "apistrike.cli",
+    "apistrike.modules",
+    "apistrike.core",
+]
