@@ -1648,7 +1648,6 @@ def auto(
     object_template: str = typer.Option("/users/v1/{username}", help="Object path template for the BOLA step."),
     spec: str = typer.Option("", "--spec", help="Optional OpenAPI/Swagger spec to seed the crawl step."),
     wordlist: str = typer.Option("", "--wordlist", "-w", help="Optional path wordlist for the crawl step."),
-    auth_profile: bool = typer.Option(False, "--auth-profile", help="Also load identities from the scope.yaml 'auth:' block (multi-identity), in addition to -u/-p."),
 ) -> None:
     """Auto (engine): run crawl -> auth -> BFLA/BOLA sharing one Scan Context.
 
@@ -1718,63 +1717,21 @@ def auto(
                     )
 
             async def auth_step(cx):
-                use_profile = bool(auth_profile or getattr(sc, "auth", []))
-                if not use_profile:
-                    # Classic single-identity path (unchanged pre-PR-8a behaviour).
-                    if not (username and password):
-                        return
-                    engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
-                    ident = engine.add_identity(username, username=username, password=password)
-                    token = await engine.login(ident)
-                    role, claims = "", {}
-                    try:
-                        decoded = decode_jwt(token)
-                        claims = decoded.get("payload", {})
-                        role = str(claims.get("role", "") or claims.get("sub", ""))
-                    except ValueError:
-                        pass
-                    cx.emit(IdentityFact(label=username, username=username, role=role), module="auth")
-                    cx.emit(TokenFact(identity=username, raw=token, claims=claims, role=role), module="auth")
-                    cx.emit(ObjectRefFact(owner=username, path=object_template.format(username=username)), module="auth")
+                if not (username and password):
                     return
-                # Declarative multi-identity path (v1.6 auth profiles, PR-8a).
-                # Local import matches this file's per-command import style.
-                from apistrike.auth.profiles import register_scope_identities
                 engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                ident = engine.add_identity(username, username=username, password=password)
+                token = await engine.login(ident)
+                role, claims = "", {}
                 try:
-                    register_scope_identities(engine, sc)
-                except Exception as exc:  # noqa: BLE001 -- surface a clean profile error
-                    typer.echo(f"  - auth: could not load scope 'auth:' profiles: {exc}")
-                    raise typer.Exit(code=1)
-                if username and password:
-                    engine.add_identity(username, username=username, password=password)
-                if not engine.profiles():
-                    typer.echo("  - auth: --auth-profile set but no identities found (scope 'auth:' empty and no -u/-p).")
-                    return
-                for ident in engine.profiles():
-                    try:
-                        if ident.provider is not None:
-                            await engine.ensure_fresh(ident)
-                        else:
-                            await engine.login(ident)
-                    except Exception as exc:  # noqa: BLE001 -- one identity failing must not abort the whole scan
-                        typer.echo(f"  - auth: identity '{ident.name}' failed to authenticate: {exc}")
-                        continue
-                    token = ident.token
-                    if not token:
-                        typer.echo(f"  - auth: identity '{ident.name}' obtained no token; skipping.")
-                        continue
-                    uname = ident.credentials.username or ident.name
-                    role, claims = ident.role or "", {}
-                    try:
-                        decoded = decode_jwt(token)
-                        claims = decoded.get("payload", {})
-                        role = str(claims.get("role", "") or claims.get("sub", "") or role)
-                    except ValueError:
-                        pass
-                    cx.emit(IdentityFact(label=ident.name, username=uname, role=role), module="auth")
-                    cx.emit(TokenFact(identity=ident.name, raw=token, claims=claims, role=role), module="auth")
-                    cx.emit(ObjectRefFact(owner=ident.name, path=object_template.format(username=uname)), module="auth")
+                    decoded = decode_jwt(token)
+                    claims = decoded.get("payload", {})
+                    role = str(claims.get("role", "") or claims.get("sub", ""))
+                except ValueError:
+                    pass
+                cx.emit(IdentityFact(label=username, username=username, role=role), module="auth")
+                cx.emit(TokenFact(identity=username, raw=token, claims=claims, role=role), module="auth")
+                cx.emit(ObjectRefFact(owner=username, path=object_template.format(username=username)), module="auth")
 
             async def bfla_step(cx):
                 endpoints = cx.facts(EndpointFact)
