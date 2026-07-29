@@ -4,6 +4,26 @@ All notable changes to **APIStrike** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-07-29
+
+Bug-fix release hardening the deterministic scanners against false positives,
+verified live against a real production target.
+
+### Fixed
+- **Excessive Data Exposure (API3) — entropy false positives.**
+  - Inline SVG path/points data, data-URIs, and asset filenames are stripped before the entropy scan, so markup noise (e.g. `1759740674untitleddesign`) is no longer flagged as a secret.
+  - URL paths and slugs such as `/upload_images/1759482020` are no longer flagged: candidate tokens are split on `/`, `_`, and `-`, and must contain a random letter+digit segment (>= 8 chars). Genuine secrets — including base64 tokens containing `/` — are still detected.
+- **Improper Inventory (API9) — `.git`/`.env` false positives.** Static leak surfaces (`/.env`, `/.git/config`) are confirmed by content signature; a `403`/blocked response is now reported as *not exposed* instead of raising a finding.
+
+### Added
+- Regression tests covering the SVG/filename, URL-path/slug, and `.git`/`.env` cases.
+
+### Changed
+- Fixed the in-code `__version__` (was `0.1.0`) to track the released version.
+
+### Validation
+- Live static site (LiteSpeed): `inventory` 0 findings (`/.git/config` 403 correctly skipped), `dataexpose` reports only a benign public email, `misconfig` reports only missing security headers — zero false positives.
+
 ## [1.0.0] — 2026-07-28
 
 First stable release. A modular, AI-assisted, fully open-source automated API
@@ -53,4 +73,5 @@ validated live against **VAmPI** and **crAPI** in CI.
 ### Tests
 - 230 passing tests.
 
+[1.0.1]: https://github.com/Tushar-Jain21/apistrike/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Tushar-Jain21/apistrike/releases/tag/v1.0.0
