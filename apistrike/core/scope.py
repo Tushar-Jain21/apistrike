@@ -29,9 +29,16 @@ class Scope:
     # controls (an aggressive client can DoS a target), so they must travel
     # with the authorization scope that already carries rate_limit /
     # max_requests / safe_mode. See ADR-0010.
-    concurrency: int = 4          # max simultaneous in-flight requests per host
-    retries: int = 2              # extra attempts after the first (safe methods only)
-    retry_backoff: float = 0.5    # base seconds for exponential backoff
+    concurrency: int = 4        # max simultaneous in-flight requests per host
+    retries: int = 2            # extra attempts after the first (safe methods only)
+    retry_backoff: float = 0.5  # base seconds for exponential backoff
+    # --- Auth subsystem (v1.6) ----------------------------------------------
+    # Optional declarative identities for this engagement. The identity a
+    # tester is authorized to use belongs with the authorization scope itself
+    # (ADR-0010). Parsed as a raw list of mappings here; apistrike.auth.profiles
+    # interprets it (and enforces ${ENV} secret references, ADR-0013). Kept as
+    # plain data so core/ takes on no dependency on the auth layer.
+    auth: list = field(default_factory=list)
 
     @classmethod
     def from_file(cls, path: str | Path) -> "Scope":
@@ -39,6 +46,9 @@ class Scope:
         if not path.exists():
             raise FileNotFoundError(f"Scope file not found: {path}")
         data = yaml.safe_load(path.read_text()) or {}
+        auth = data.get("auth", []) or []
+        if not isinstance(auth, list):
+            raise ValueError("'auth' in the scope file must be a list of profiles.")
         return cls(
             allowed_hosts=[str(h).lower() for h in data.get("allowed_hosts", [])],
             rate_limit=float(data.get("rate_limit", 5.0)),
@@ -48,6 +58,7 @@ class Scope:
             concurrency=int(data.get("concurrency", 4)),
             retries=int(data.get("retries", 2)),
             retry_backoff=float(data.get("retry_backoff", 0.5)),
+            auth=auth,
         )
 
     def host_in_scope(self, url: str) -> bool:
