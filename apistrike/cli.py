@@ -1638,6 +1638,172 @@ if __name__ == "__main__":
     app()
 
 
+@app.command()
+def auto(
+    target: str = typer.Argument(..., help="Base URL of the API to test."),
+    scope: str = typer.Option("scope.yaml", help="Path to the authorized-scope file."),
+    username: str = typer.Option("", "--username", "-u", help="Identity username for the authenticated feedback loop."),
+    password: str = typer.Option("", "--password", "-p", help="Password for --username."),
+    login_path: str = typer.Option("/users/v1/login", help="Login endpoint path on the target."),
+    object_template: str = typer.Option("/users/v1/{username}", help="Object path template for the BOLA step."),
+    spec: str = typer.Option("", "--spec", help="Optional OpenAPI/Swagger spec to seed the crawl step."),
+    wordlist: str = typer.Option("", "--wordlist", "-w", help="Optional path wordlist for the crawl step."),
+) -> None:
+    """Auto (engine): run crawl -> auth -> BFLA/BOLA sharing one Scan Context.
+
+    A planner sequences the modules from shared facts: crawl emits discovered
+    endpoints, login emits an identity + decoded-JWT role, and the authorization
+    modules then run against the DISCOVERED endpoints/role instead of hardcoded
+    paths. All findings land in a single durable run.
+    """
+    import asyncio
+
+    from apistrike.core.context import (
+        Endpoint as EndpointFact,
+        Identity as IdentityFact,
+        ObjectRef as ObjectRefFact,
+        ScanContext,
+        Token as TokenFact,
+    )
+    from apistrike.core.planner import Planner, Step
+    from apistrike.core.http_client import ScopedHTTPClient
+    from apistrike.auth.auth_engine import AuthEngine, LoginConfig, decode_jwt
+    from apistrike.recon.crawler import Crawler, load_wordlist
+    from apistrike.modules.bfla import BflaModule, BflaIdentity, Operation
+    from apistrike.modules.bola import BolaModule, BolaIdentity, ObjectRef
+
+    try:
+        sc = Scope.from_file(scope)
+    except FileNotFoundError:
+        typer.echo(f"Scope file '{scope}' not found. Run: apistrike init-scope")
+        raise typer.Exit(code=1)
+
+    try:
+        target = normalize_target(target)
+        sc.assert_in_scope(target)
+    except OutOfScopeError as e:
+        typer.echo(f"Refused: {e}")
+        raise typer.Exit(code=2)
+
+    settings = Settings.load()
+    typer.echo(f"Target {target} is IN SCOPE. Safe mode: {sc.safe_mode}. (engine: auto)")
+
+    seeds = []
+    if spec:
+        try:
+            api = load_spec(spec)
+            seeds = [e.path for e in api.endpoints]
+        except Exception as e:  # noqa: BLE001
+            typer.echo(f"Could not load spec '{spec}': {e}")
+    words = load_wordlist(wordlist or None)
+
+    async def _drive(store):
+        ctx = ScanContext()
+        async with ScopedHTTPClient(sc) as client:
+
+            async def crawl_step(cx):
+                crawler = Crawler(
+                    client, base_url=target,
+                    seed_endpoints=seeds, path_words=words, param_words=[],
+                    bases=["/"], fuzz_params=False, method_enum=True, safe=sc.safe_mode,
+                )
+                res = await crawler.run(store=store)
+                for e in res.endpoints:
+                    methods = tuple(getattr(e, "methods_allowed", ()) or ())
+                    src = "spec" if getattr(e, "source", "") == "spec" else "shadow"
+                    cx.emit(
+                        EndpointFact(method=(methods[0] if methods else "GET"), path=e.path, source=src),
+                        module="crawl",
+                    )
+
+            async def auth_step(cx):
+                if not (username and password):
+                    return
+                engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                ident = engine.add_identity(username, username=username, password=password)
+                token = await engine.login(ident)
+                role, claims = "", {}
+                try:
+                    decoded = decode_jwt(token)
+                    claims = decoded.get("payload", {})
+                    role = str(claims.get("role", "") or claims.get("sub", ""))
+                except ValueError:
+                    pass
+                cx.emit(IdentityFact(label=username, username=username, role=role), module="auth")
+                cx.emit(TokenFact(identity=username, raw=token, claims=claims, role=role), module="auth")
+                cx.emit(ObjectRefFact(owner=username, path=object_template.format(username=username)), module="auth")
+
+            async def bfla_step(cx):
+                endpoints = cx.facts(EndpointFact)
+                idents = cx.facts(IdentityFact)
+                toks = {t.identity: t for t in cx.facts(TokenFact)}
+                if not (endpoints and idents):
+                    return
+                operations = [Operation("GET", e.path) for e in endpoints][:25]
+                bidents = []
+                for it in idents:
+                    tok = toks.get(it.label)
+                    hdrs = {"Authorization": f"Bearer {tok.raw}"} if tok else {}
+                    bidents.append(BflaIdentity(label=it.label, headers=hdrs, role=it.role or "user"))
+                module = BflaModule(
+                    client, base_url=target, identities=bidents, operations=operations,
+                    admin_label=None, safe=sc.safe_mode, unauth_check=True,
+                )
+                await module.run(store=store)
+
+            async def bola_step(cx):
+                idents = cx.facts(IdentityFact)
+                objs = cx.facts(ObjectRefFact)
+                toks = {t.identity: t for t in cx.facts(TokenFact)}
+                if not (idents and objs):
+                    return
+                bidents, orefs = [], []
+                for it in idents:
+                    tok = toks.get(it.label)
+                    hdrs = {"Authorization": f"Bearer {tok.raw}"} if tok else {}
+                    bidents.append(BolaIdentity(label=it.label, headers=hdrs, username=it.username))
+                for o in objs:
+                    orefs.append(ObjectRef(path=o.path, owner_label=o.owner, name=f"{o.owner}'s object"))
+                module = BolaModule(
+                    client, base_url=target, identities=bidents, objects=orefs,
+                    unauth_check=True, enumerate_spread=0,
+                )
+                await module.run(store=store)
+
+            steps = [
+                Step("crawl", crawl_step, produces=frozenset({"endpoint"})),
+                Step("auth", auth_step, produces=frozenset({"identity", "token", "object"})),
+                Step("bfla", bfla_step, consumes=frozenset({"identity", "token", "endpoint"})),
+                Step("bola", bola_step, consumes=frozenset({"identity", "object", "token"})),
+            ]
+            plan = await Planner(steps).run(ctx)
+            return ctx, plan
+
+    try:
+        with _run_store(
+            settings, target=target, command="auto",
+            modules=["crawl", "auth", "bfla", "bola"],
+            scope_summary={"safe_mode": sc.safe_mode},
+        ) as store:
+            ctx, plan = asyncio.run(_drive(store))
+            summary = store.summary()
+    except typer.Exit:
+        raise
+    except Exception as e:  # noqa: BLE001 -- surface a clean CLI error
+        typer.echo(f"Auto engine failed: {e}")
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"Planner ran {len(plan.order)} step(s) over {plan.rounds} round(s): "
+        + " -> ".join(plan.order) + "."
+    )
+    for note in plan.notes:
+        typer.echo(f"  - {note}")
+    typer.echo(f"Scan context facts: {ctx.snapshot_counts()}.")
+    typer.echo(f"Findings this run recorded (total in DB: {summary['total']}).")
+    typer.echo("Run 'apistrike report' to generate the Markdown report.")
+
+
 def main() -> None:
     """Console-script entry point for the ``apistrike`` command."""
     app()

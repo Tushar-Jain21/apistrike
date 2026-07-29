@@ -4,6 +4,16 @@ All notable changes to **APIStrike** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-07-29
+
+### Added
+- Shared Scan Context (`apistrike/core/context.py`): a typed in-memory blackboard (Endpoint/Identity/Token/ObjectRef/Param facts) with idempotent emit, typed queries, provenance, and a `to_dict` serialization seam (ADR-0006).
+- Planner (`apistrike/core/planner.py`): a bounded fixed-point scheduler that runs declarative Steps (consumes/produces fact kinds) in dependency order (ADR-0007).
+- `apistrike auto <target>`: an engine command that sequences crawl -> auth -> BFLA/BOLA through one shared Scan Context and a single durable run, driving the authz modules against discovered endpoints and the decoded JWT role.
+
+### Notes
+- Module `run()` signatures are unchanged; emit/consume adapters live inside the `auto` command, so every existing per-module command behaves exactly as before.
+
 ## [1.3.0] - 2026-07-29
 
 ### Added
