@@ -263,6 +263,16 @@ def _is_probable_secret(tok: str, threshold: float) -> bool:
         return False
     if len(set(tok)) < 12:
         return False
+    # --- pathfix: reject path/slug-like tokens (e.g. "/upload_images/1759482020").
+    # Split on path/slug separators and require at least one segment that itself
+    # mixes letters and digits. Real tokens are random *within* a segment; URL
+    # paths and slugs split into pure-word or pure-number parts.
+    _segments = [s for s in re.split(r"[/_\-]", tok) if s]
+    if not any(
+        len(s) >= 8 and any(c.isalpha() for c in s) and any(c.isdigit() for c in s)
+        for s in _segments
+    ):
+        return False
     return True
 
 def _scan_entropy(endpoint: str, text: str, threshold: float, min_len: int, exclude: set) -> List[Finding]:

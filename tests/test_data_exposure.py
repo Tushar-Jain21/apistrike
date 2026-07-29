@@ -115,3 +115,21 @@ def test_helpers():
     assert _looks_hashed("5f4dcc3b5aa765d61d8327deb882cf99") is True
     assert _looks_hashed("hunter2") is False
     assert "redacted" in _mask("supersecretvalue123")
+
+
+# --- pathfix regression tests -------------------------------------------------
+UPLOAD = '{"img": "/upload_images/1759482020"}'
+
+
+def test_entropy_ignores_url_paths():
+    """A benign upload URL path must not be flagged as a high-entropy secret."""
+    cli = Client({"/u": UPLOAD})
+    res = run(DataExposureModule(cli, "http://t", [DataExposureTarget("/u")], checks=("entropy",), entropy_min_len=24).run())
+    assert res.findings == []
+
+
+def test_is_probable_secret_rejects_url_paths():
+    assert _is_probable_secret("/upload_images/1759482020", 4.0) is False
+    assert _is_probable_secret("/api/v2/user_profile_images", 4.0) is False
+    # a genuine random token containing a slash (base64-style) is still caught
+    assert _is_probable_secret("aZ9kQ2mX/pL4vB8n+R3tW6yE1uH5sD0fG", 4.0) is True
