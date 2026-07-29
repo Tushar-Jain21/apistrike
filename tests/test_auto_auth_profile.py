@@ -2,24 +2,41 @@
 identities from a scope's `auth:` block.
 
 These tests run in the full dev environment (typer + httpx installed). They do
-NOT touch the network: the CLI help test is offline, and the profile-loading
-test exercises the shipped v1.6 building block (register_scope_identities)
-against a fake engine, proving the exact call `auto` now makes is valid.
+NOT touch the network. The flag test introspects the Click command object
+instead of scraping Rich-rendered `--help` text (which wraps + injects ANSI
+escape codes at narrow terminal widths, so a literal substring match is
+unreliable across environments).
 """
-import os
-
 import pytest
-from typer.testing import CliRunner
 
 from apistrike.cli import app
 
-runner = CliRunner()
+
+def _auto_command():
+    """Return the Click command object for `apistrike auto`."""
+    from typer.main import get_command
+
+    group = get_command(app)
+    commands = getattr(group, "commands", {})
+    assert "auto" in commands, f"'auto' command not registered; have: {sorted(commands)}"
+    return commands["auto"]
 
 
-def test_auto_help_lists_auth_profile_flag():
-    result = runner.invoke(app, ["auto", "--help"])
+def test_auto_defines_auth_profile_option():
+    """Render-independent: the --auth-profile option must exist on `auto`."""
+    cmd = _auto_command()
+    option_flags = {flag for param in cmd.params for flag in getattr(param, "opts", [])}
+    param_names = {param.name for param in cmd.params}
+    assert "--auth-profile" in option_flags, f"flags: {sorted(option_flags)}"
+    assert "auth_profile" in param_names, f"params: {sorted(param_names)}"
+
+
+def test_auto_help_renders_cleanly():
+    """Smoke test: `auto --help` exits 0 (no width/ANSI assumptions)."""
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(app, ["auto", "--help"])
     assert result.exit_code == 0, result.output
-    assert "--auth-profile" in result.output
 
 
 def test_profiles_helper_is_importable_and_callable():
@@ -40,7 +57,6 @@ class _FakeEngine:
 
     def __init__(self):
         self.identities = {}
-        # register_scope_identities reads engine.config for a default login.
         from apistrike.auth.auth_engine import LoginConfig
 
         self.config = LoginConfig()
@@ -70,11 +86,8 @@ def test_register_scope_identities_builds_multiple(monkeypatch):
 
     assert [i.name for i in idents] == ["user1", "admin"]
     assert engine.profiles() == idents
-    # Roles survive so BFLA/BOLA can compare privilege levels.
     assert {i.name: i.role for i in idents} == {"user1": "user", "admin": "admin"}
-    # The static-token identity already carries its token.
-    admin = engine.identities["admin"]
-    assert admin.token == "header.payload.sig"
+    assert engine.identities["admin"].token == "header.payload.sig"
 
 
 def test_register_scope_identities_rejects_inline_secret():

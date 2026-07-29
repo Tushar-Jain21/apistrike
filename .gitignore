@@ -9,3 +9,6 @@ scope.yaml
 wordlists/
 crapi_art/
 crapi_run*.log
+
+# applier backups
+*.bak
