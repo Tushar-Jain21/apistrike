@@ -71,7 +71,7 @@ from apistrike.core.scope import Scope, OutOfScopeError
 from apistrike.recon.spec_parser import load_spec
 from apistrike.reporting.report import write_report
 
-__version__ = "1.0.1"
+from apistrike import __version__
 
 app = typer.Typer(
     add_completion=False,
@@ -1528,3 +1528,12 @@ def ai_report(
 
 if __name__ == "__main__":
     app()
+
+
+def main() -> None:
+    """Console-script entry point for the ``apistrike`` command."""
+    app()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

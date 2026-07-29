@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "apistrike"
+dynamic = ["version"]
+description = "AI-assisted, open-source API penetration-testing framework"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Tushar Jain" }]
+keywords = ["security", "api", "pentest", "owasp", "appsec", "scanner"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = [
+    "httpx",
+    "typer",
+    "pyyaml",
+    "prance",
+    "openapi-spec-validator",
+    "pyjwt",
+    "jinja2",
+]
+
+[project.optional-dependencies]
+pdf = ["weasyprint>=60"]
+dev = ["pytest", "ruff", "import-linter"]
+
+[project.urls]
+Homepage = "https://github.com/Tushar-Jain21/apistrike"
+Repository = "https://github.com/Tushar-Jain21/apistrike"
+Changelog = "https://github.com/Tushar-Jain21/apistrike/blob/main/CHANGELOG.md"
+
+[project.scripts]
+apistrike = "apistrike.cli:main"
+
+# Reserved for the future Plugin SDK (Tranche C). Declared now; no discovery logic yet.
+[project.entry-points."apistrike.modules"]
+# example = "your_package.module:ModuleClass"
+
+[tool.hatch.version]
+path = "apistrike/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["apistrike"]

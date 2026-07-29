@@ -4,6 +4,15 @@ All notable changes to **APIStrike** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] -- 2026-07-29
+
+### Added
+- Packaging via `pyproject.toml` (hatchling): APIStrike is now installable with `pip install -e .` and ships a real `apistrike` console command.
+- `apistrike.__version__` is now the single source of truth for the version.
+
+### Changed
+- The CLI version string now reads from `apistrike.__version__` instead of a hardcoded literal, removing the version-drift class of bug.
+
 ## [1.0.1] — 2026-07-29
 
 Bug-fix release hardening the deterministic scanners against false positives,
@@ -73,5 +82,6 @@ validated live against **VAmPI** and **crAPI** in CI.
 ### Tests
 - 230 passing tests.
 
+[1.1.0]: https://github.com/Tushar-Jain21/apistrike/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/Tushar-Jain21/apistrike/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Tushar-Jain21/apistrike/releases/tag/v1.0.0
