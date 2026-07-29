@@ -4,6 +4,22 @@ All notable changes to **APIStrike** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] -- 2026-07-29
+
+### Added
+- **Durable scan-run identity.** New `scan_runs` table records one row per scan (target, tool version, command, modules, scope summary, status, start/finish timestamps). Every finding is now linked to the run that produced it.
+- **Stable finding fingerprint.** `Finding.fingerprint` = `sha256(owasp_id | endpoint | title | key)` over the *templated* endpoint, excluding volatile evidence -- a stable identity for "the same vulnerability" across runs and the foundation for a future new/fixed/regressed diff.
+- Optional `Finding.key` discriminator (e.g. the vulnerable parameter) so distinct issues on one endpoint don't collide in the fingerprint.
+- `FindingsStore` run lifecycle + query API: `begin_run()`, `finish_run()`, `runs()`, `latest_run()`, `get_run()`, and `run_id` / `all_runs` selectors on `all()`, `summary()`, and `by_severity()`.
+- In-place, non-destructive, idempotent **v0->v1 migration** (`migrate_v0_to_v1()`), versioned with `PRAGMA user_version`. Legacy databases are migrated on open: orphan findings are backfilled into a synthetic `legacy-import` run, fingerprinted, and true duplicates are collapsed (evidence merged).
+
+### Changed
+- **Reports default to the latest run**, not the all-time contents of `findings.db` (which was effectively a bug on re-scan). `render_markdown()` / `write_report()` accept `run_id=` for a specific run and `all_runs=True` to restore the historical view, and now surface run metadata (run id, start time, tool version) plus the persisted target.
+- `FindingsStore.add()` keeps its one-argument signature but now attaches to the active run (lazily opening a default run if none), computes the fingerprint, and upserts on `(run_id, fingerprint)` -- merging evidence instead of inserting duplicate rows.
+
+### Notes
+- CLI wiring of explicit `begin_run()` / `finish_run()` plus `--run` / `--all-runs` and a `runs` listing command lands in a follow-up change.
+
 ## [1.1.1] -- 2026-07-29
 
 ### Added
@@ -91,6 +107,7 @@ validated live against **VAmPI** and **crAPI** in CI.
 ### Tests
 - 230 passing tests.
 
+[1.2.0]: https://github.com/Tushar-Jain21/apistrike/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/Tushar-Jain21/apistrike/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/Tushar-Jain21/apistrike/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/Tushar-Jain21/apistrike/releases/tag/v1.0.1

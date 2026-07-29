@@ -2,6 +2,13 @@
 
 Consumes the FindingsStore and renders a deterministic, professional Markdown
 report. HTML/PDF (Jinja2 + WeasyPrint) build on top of this in Phase 6.
+
+As of v1.2 the report is *run-scoped*: by default it renders the latest scan
+run (``store.all()`` / ``store.summary()`` already default to the latest run)
+and pulls the target + run metadata from the persisted ``scan_runs`` row. Pass
+``run_id=`` to render a specific run, or ``all_runs=True`` for the historical
+(pre-v1.2) all-runs view. An explicit ``target`` argument still overrides the
+persisted one for backward compatibility.
 """
 from __future__ import annotations
 
@@ -22,16 +29,34 @@ _SEVERITY_EMOJI = {
 }
 
 
-def render_markdown(store: FindingsStore, target: str = "N/A") -> str:
-    findings = store.all()
-    summary = store.summary()
+def render_markdown(store: FindingsStore, target: str = "N/A",
+                    run_id: str | None = None, all_runs: bool = False) -> str:
+    findings = store.all(run_id=run_id, all_runs=all_runs)
+    summary = store.summary(run_id=run_id, all_runs=all_runs)
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    run = None
+    if not all_runs:
+        try:
+            run = store.get_run(run_id) if run_id else store.latest_run()
+        except Exception:
+            run = None
+    if (not target or target == "N/A") and run and run.get("target"):
+        target = run["target"]
 
     lines: list[str] = []
     lines.append("# APIStrike -- API Penetration Test Report")
     lines.append("")
     lines.append(f"- **Target:** {target}")
     lines.append(f"- **Generated:** {generated}")
+    if all_runs:
+        lines.append("- **Scope:** all runs (historical)")
+    elif run:
+        lines.append(f"- **Run:** `{run['run_id']}`")
+        if run.get("started_at"):
+            lines.append(f"- **Run started:** {run['started_at']}")
+        if run.get("tool_version"):
+            lines.append(f"- **Tool version:** {run['tool_version']}")
     lines.append(f"- **Total findings:** {summary['total']}")
     lines.append("")
 
@@ -81,8 +106,12 @@ def render_markdown(store: FindingsStore, target: str = "N/A") -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_report(store: FindingsStore, path: str | Path, target: str = "N/A") -> Path:
+def write_report(store: FindingsStore, path: str | Path, target: str = "N/A",
+                 run_id: str | None = None, all_runs: bool = False) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_markdown(store, target=target), encoding="utf-8")
+    path.write_text(
+        render_markdown(store, target=target, run_id=run_id, all_runs=all_runs),
+        encoding="utf-8",
+    )
     return path
