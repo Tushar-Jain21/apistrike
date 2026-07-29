@@ -24,6 +24,14 @@ class Scope:
     max_requests: int = 5000
     safe_mode: bool = True
     allow_destructive: bool = False
+    # --- HTTP engine (v1.5) --------------------------------------------------
+    # Concurrency and retry live in Scope, not Settings: they are *safety*
+    # controls (an aggressive client can DoS a target), so they must travel
+    # with the authorization scope that already carries rate_limit /
+    # max_requests / safe_mode. See ADR-0010.
+    concurrency: int = 4          # max simultaneous in-flight requests per host
+    retries: int = 2              # extra attempts after the first (safe methods only)
+    retry_backoff: float = 0.5    # base seconds for exponential backoff
 
     @classmethod
     def from_file(cls, path: str | Path) -> "Scope":
@@ -37,6 +45,9 @@ class Scope:
             max_requests=int(data.get("max_requests", 5000)),
             safe_mode=bool(data.get("safe_mode", True)),
             allow_destructive=bool(data.get("allow_destructive", False)),
+            concurrency=int(data.get("concurrency", 4)),
+            retries=int(data.get("retries", 2)),
+            retry_backoff=float(data.get("retry_backoff", 0.5)),
         )
 
     def host_in_scope(self, url: str) -> bool:
