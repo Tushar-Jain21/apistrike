@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
+import re
 
 import yaml
 
@@ -53,3 +54,26 @@ class Scope:
                 f"Refusing request to out-of-scope host: {url!r}. "
                 f"Allowed hosts: {self.allowed_hosts}"
             )
+
+
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
+def normalize_target(raw: str, default_scheme: str = "https") -> str:
+    """Normalize a user-supplied target host or URL (CLI/adapter layer only).
+
+    A bare, scheme-less input such as ``api.example.com`` or
+    ``api.example.com:8443/base`` gets ``default_scheme`` ("https") prepended so
+    it is accepted instead of being silently refused by the scope check. Inputs
+    that already carry an explicit scheme are returned unchanged -- so
+    ``http://host`` still forces plaintext HTTP. ``Scope`` itself stays strict;
+    this helper only makes the CLI forgiving about a missing scheme.
+    """
+    if not raw:
+        return raw
+    stripped = raw.strip()
+    if not stripped:
+        return raw
+    if _SCHEME_RE.match(stripped):
+        return stripped
+    return default_scheme + "://" + stripped

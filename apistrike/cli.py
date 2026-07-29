@@ -67,7 +67,7 @@ import typer
 
 from apistrike.core.config import Settings
 from apistrike.core.findings import FindingsStore
-from apistrike.core.scope import Scope, OutOfScopeError
+from apistrike.core.scope import Scope, OutOfScopeError, normalize_target
 from apistrike.recon.spec_parser import load_spec
 from apistrike.reporting.report import write_report
 
@@ -125,6 +125,7 @@ def scan(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as e:
         typer.echo(f"Refused: {e}")
@@ -210,6 +211,7 @@ def bola(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as e:
         typer.echo(f"Refused: {e}")
@@ -304,6 +306,7 @@ def login(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as e:
         typer.echo(f"Refused: {e}")
@@ -386,6 +389,7 @@ def crawl(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as e:
         typer.echo(f"Refused: {e}")
@@ -489,6 +493,7 @@ def bfla(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as e:
         typer.echo(f"Refused: {e}")
@@ -595,6 +600,7 @@ def inject(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as e:
         typer.echo(f"Refused: {e}")
@@ -698,6 +704,7 @@ def ssrf(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as exc:
         typer.echo(f"Refused: {exc}")
@@ -816,6 +823,7 @@ def massassign(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as exc:
         typer.echo(f"Refused: {exc}")
@@ -906,6 +914,7 @@ def misconfig(
         typer.echo(f"Scope file not found: {scope}")
         raise typer.Exit(code=1)
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as exc:
         typer.echo(f"Target out of scope: {exc}")
@@ -1009,6 +1018,7 @@ def run_module(
         typer.echo(f"Scope file not found: {scope}")
         raise typer.Exit(code=1)
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as exc:
         typer.echo(f"Target out of scope: {exc}")
@@ -1092,6 +1102,7 @@ def dataexpose(
         typer.echo(f"Scope file not found: {scope}")
         raise typer.Exit(code=1)
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as exc:
         typer.echo(f"Target out of scope: {exc}")
@@ -1180,6 +1191,7 @@ def ratelimit(
         typer.echo(f"Scope file not found: {scope}")
         raise typer.Exit(code=1)
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as exc:
         typer.echo(f"Target out of scope: {exc}")
@@ -1267,6 +1279,7 @@ def inventory(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as e:
         typer.echo(f"Refused: {e}")
@@ -1346,6 +1359,7 @@ def graphql(
         raise typer.Exit(code=1)
 
     try:
+        target = normalize_target(target)
         sc.assert_in_scope(target)
     except OutOfScopeError as e:
         typer.echo(f"Refused: {e}")
