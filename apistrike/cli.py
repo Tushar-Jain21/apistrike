@@ -235,6 +235,7 @@ def bola(
     from apistrike.auth.auth_engine import AuthEngine, LoginConfig
     from apistrike.core.http_client import ScopedHTTPClient
     from apistrike.modules.bola import BolaModule, BolaIdentity, ObjectRef
+    from apistrike.auth.refresh_client import RefreshingClient, IDENTITY_HEADER
 
     try:
         sc = Scope.from_file(scope)
@@ -795,6 +796,7 @@ def ssrf(
             headers = {}
             if username and password:
                 engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                auth_ctx["engine"] = engine
                 ident = engine.add_identity(username, username=username, password=password)
                 token = await engine.login(ident)
                 headers = {"Authorization": f"Bearer {token}"}
@@ -914,6 +916,7 @@ def massassign(
             headers = {}
             if username and password:
                 engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                auth_ctx["engine"] = engine
                 ident = engine.add_identity(username, username=username, password=password)
                 token = await engine.login(ident)
                 headers = {"Authorization": f"Bearer {token}"}
@@ -1700,6 +1703,7 @@ def auto(
 
     async def _drive(store):
         ctx = ScanContext()
+        auth_ctx = {"engine": None}
         async with ScopedHTTPClient(sc) as client:
 
             async def crawl_step(cx):
@@ -1724,6 +1728,7 @@ def auto(
                     if not (username and password):
                         return
                     engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                    auth_ctx["engine"] = engine
                     ident = engine.add_identity(username, username=username, password=password)
                     token = await engine.login(ident)
                     role, claims = "", {}
@@ -1741,6 +1746,7 @@ def auto(
                 # Local import matches this file's per-command import style.
                 from apistrike.auth.profiles import register_scope_identities
                 engine = AuthEngine(client, base_url=target, login_config=LoginConfig(login_path=login_path))
+                auth_ctx["engine"] = engine
                 try:
                     register_scope_identities(engine, sc)
                 except Exception as exc:  # noqa: BLE001 -- surface a clean profile error
@@ -1783,13 +1789,18 @@ def auto(
                 if not (endpoints and idents):
                     return
                 operations = [Operation("GET", e.path) for e in endpoints][:25]
+                engine = auth_ctx.get("engine")
+                req_client = RefreshingClient(client, engine) if engine is not None else client
                 bidents = []
                 for it in idents:
                     tok = toks.get(it.label)
-                    hdrs = {"Authorization": f"Bearer {tok.raw}"} if tok else {}
+                    if engine is not None and it.label in getattr(engine, "identities", {}):
+                        hdrs = {IDENTITY_HEADER: it.label}
+                    else:
+                        hdrs = {"Authorization": f"Bearer {tok.raw}"} if tok else {}
                     bidents.append(BflaIdentity(label=it.label, headers=hdrs, role=it.role or "user"))
                 module = BflaModule(
-                    client, base_url=target, identities=bidents, operations=operations,
+                    req_client, base_url=target, identities=bidents, operations=operations,
                     admin_label=None, safe=sc.safe_mode, unauth_check=True,
                 )
                 await module.run(store=store)
@@ -1800,15 +1811,20 @@ def auto(
                 toks = {t.identity: t for t in cx.facts(TokenFact)}
                 if not (idents and objs):
                     return
+                engine = auth_ctx.get("engine")
+                req_client = RefreshingClient(client, engine) if engine is not None else client
                 bidents, orefs = [], []
                 for it in idents:
                     tok = toks.get(it.label)
-                    hdrs = {"Authorization": f"Bearer {tok.raw}"} if tok else {}
+                    if engine is not None and it.label in getattr(engine, "identities", {}):
+                        hdrs = {IDENTITY_HEADER: it.label}
+                    else:
+                        hdrs = {"Authorization": f"Bearer {tok.raw}"} if tok else {}
                     bidents.append(BolaIdentity(label=it.label, headers=hdrs, username=it.username))
                 for o in objs:
                     orefs.append(ObjectRef(path=o.path, owner_label=o.owner, name=f"{o.owner}'s object"))
                 module = BolaModule(
-                    client, base_url=target, identities=bidents, objects=orefs,
+                    req_client, base_url=target, identities=bidents, objects=orefs,
                     unauth_check=True, enumerate_spread=0,
                 )
                 await module.run(store=store)
