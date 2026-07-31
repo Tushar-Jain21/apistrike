@@ -280,3 +280,7 @@ async def run_advanced_jwt_checks(module, result, live: bool) -> None:
     await _check_algorithm_confusion(module, result)
     await _check_kid_injection(module, result)
     await _check_jwk_header_injection(module, result)
+    listener = getattr(module, "oast_listener", None)
+    if listener is not None:
+        from apistrike.modules.jwt_header_urls import run_jku_x5u_checks
+        await run_jku_x5u_checks(module, result, listener, live)

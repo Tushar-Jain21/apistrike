@@ -151,6 +151,7 @@ def scan(
     sarif: str = typer.Option("", "--sarif", help="Write findings as SARIF 2.1.0 to this path (GitHub code scanning)."),
     json_out: str = typer.Option("", "--json", help="Write findings as JSON to this path."),
     fail_on: str = typer.Option("", "--fail-on", help="Exit non-zero if any finding is at/above this severity (info|low|medium|high|critical)."),
+    jku_oast: str = typer.Option("", "--jku-oast", help="Public host[:port] the target can reach; starts an OAST listener to confirm JWT jku/x5u header-URL fetch (SSRF/key-injection)."),
 ) -> None:
     """Run a scan: validate scope, then (with -u/-p) run the broken-auth module."""
     try:
@@ -199,6 +200,12 @@ def scan(
                 module.public_key_pem = open(pubkey, encoding="utf-8").read()
             if jwks_url:
                 module.jwks_url = jwks_url
+            if jku_oast:
+                from apistrike.modules.ssrf import OASTListener
+                _oast_host, _sep, _oast_port = jku_oast.partition(":")
+                module.oast_listener = OASTListener(host="0.0.0.0", port=int(_oast_port or 0), public_host=(_oast_host or None)).start()
+                module.oast_wait_ms = 3000
+                typer.echo(f"OAST listener started at {module.oast_listener.base_url} (jku/x5u checks armed).")
             return await module.run(store=store)
 
     try:
