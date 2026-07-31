@@ -70,6 +70,7 @@ from apistrike.core.findings import FindingsStore
 from apistrike.core.scope import Scope, OutOfScopeError, normalize_target
 from apistrike.recon.spec_parser import load_spec
 from apistrike.reporting.report import write_report
+from apistrike.reporting.ci_exporters import export_findings, evaluate_gate
 
 from apistrike import __version__
 
@@ -145,6 +146,12 @@ def scan(
         help="Body field name for the identity on login (e.g. 'email' for crAPI).",
     ),
     probe_path: str = typer.Option("/me", help="Authenticated endpoint used to test tampered tokens."),
+    pubkey: str = typer.Option("", "--pubkey", help="Path to the server's public key (PEM) for JWT algorithm-confusion tests."),
+    jwks_url: str = typer.Option("", "--jwks-url", help="URL/path to the server's JWKS to recover the public key for algorithm-confusion tests."),
+    sarif: str = typer.Option("", "--sarif", help="Write findings as SARIF 2.1.0 to this path (GitHub code scanning)."),
+    json_out: str = typer.Option("", "--json", help="Write findings as JSON to this path."),
+    fail_on: str = typer.Option("", "--fail-on", help="Exit non-zero if any finding is at/above this severity (info|low|medium|high|critical)."),
+    jku_oast: str = typer.Option("", "--jku-oast", help="Public host[:port] the target can reach; starts an OAST listener to confirm JWT jku/x5u header-URL fetch (SSRF/key-injection)."),
 ) -> None:
     """Run a scan: validate scope, then (with -u/-p) run the broken-auth module."""
     try:
@@ -189,6 +196,16 @@ def scan(
             module = BrokenAuthModule(
                 client, base_url=target, valid_token=token, probe_path=probe_path
             )
+            if pubkey:
+                module.public_key_pem = open(pubkey, encoding="utf-8").read()
+            if jwks_url:
+                module.jwks_url = jwks_url
+            if jku_oast:
+                from apistrike.modules.ssrf import OASTListener
+                _oast_host, _sep, _oast_port = jku_oast.partition(":")
+                module.oast_listener = OASTListener(host="0.0.0.0", port=int(_oast_port or 0), public_host=(_oast_host or None)).start()
+                module.oast_wait_ms = 3000
+                typer.echo(f"OAST listener started at {module.oast_listener.base_url} (jku/x5u checks armed).")
             return await module.run(store=store)
 
     try:
@@ -211,6 +228,19 @@ def scan(
     for f in result.findings:
         typer.echo(f"  [{f.severity.upper()}] {f.title}")
     typer.echo("Run 'apistrike report' to generate the Markdown report.")
+    if sarif:
+        typer.echo(f"SARIF written to {export_findings(result.findings, sarif, fmt='sarif', target=target)}")
+    if json_out:
+        typer.echo(f"JSON written to {export_findings(result.findings, json_out, fmt='json', target=target)}")
+    if fail_on:
+        try:
+            gate = evaluate_gate(result.findings, fail_on)
+        except ValueError as exc:
+            typer.echo(str(exc))
+            raise typer.Exit(code=1)
+        if gate['fail']:
+            typer.echo(f"Gate: {gate['count']} finding(s) at/above '{fail_on}' -- failing build (exit 3).")
+            raise typer.Exit(code=3)
 
 
 @app.command()
