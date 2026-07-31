@@ -145,6 +145,8 @@ def scan(
         help="Body field name for the identity on login (e.g. 'email' for crAPI).",
     ),
     probe_path: str = typer.Option("/me", help="Authenticated endpoint used to test tampered tokens."),
+    pubkey: str = typer.Option("", "--pubkey", help="Path to the server's public key (PEM) for JWT algorithm-confusion tests."),
+    jwks_url: str = typer.Option("", "--jwks-url", help="URL/path to the server's JWKS to recover the public key for algorithm-confusion tests."),
 ) -> None:
     """Run a scan: validate scope, then (with -u/-p) run the broken-auth module."""
     try:
@@ -189,6 +191,10 @@ def scan(
             module = BrokenAuthModule(
                 client, base_url=target, valid_token=token, probe_path=probe_path
             )
+            if pubkey:
+                module.public_key_pem = open(pubkey, encoding="utf-8").read()
+            if jwks_url:
+                module.jwks_url = jwks_url
             return await module.run(store=store)
 
     try:
