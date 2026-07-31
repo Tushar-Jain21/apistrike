@@ -7,3 +7,4 @@ pyjwt
 jinja2
 pytest
 weasyprint>=60
+cryptography>=42,<44

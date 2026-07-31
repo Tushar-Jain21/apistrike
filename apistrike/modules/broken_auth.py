@@ -34,6 +34,7 @@ from typing import Iterable, List, Optional
 
 from apistrike.auth.auth_engine import _b64url_decode, decode_jwt
 from apistrike.core.findings import Finding
+from apistrike.modules.jwt_advanced import run_advanced_jwt_checks
 
 # A deliberately small, fast wordlist of secrets common in tutorials,
 # boilerplate, and CTF targets. Real engagements can pass a larger list.
@@ -152,6 +153,8 @@ class BrokenAuthModule:
         self.valid_token = valid_token
         self.probe_path = probe_path if probe_path.startswith("/") else "/" + probe_path
         self.secrets = tuple(secrets)
+        self.public_key_pem = getattr(self, 'public_key_pem', None)
+        self.jwks_url = getattr(self, 'jwks_url', None)
         self.status_valid: Optional[int] = None
         self.status_unauth: Optional[int] = None
 
@@ -330,6 +333,7 @@ class BrokenAuthModule:
         await self._check_alg_none(result, live)
         await self._check_weak_secret(result, live)
         await self._check_expiry(result, live)
+        await run_advanced_jwt_checks(self, result, live)
         if store is not None:
             for finding in result.findings:
                 store.add(finding)
